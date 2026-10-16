@@ -1,0 +1,2147 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: EPL-2.0
+# Copyright (c) 2026 Multiply
+"""claude-bardo: remember every interactive Claude Code session and bring the dead
+ones back after a reboot, a terminal crash or a power cut.
+
+  list         what died, what is live (the default; --all adds closed ones, --json for tools)
+  restore      relaunch restorable sessions: picker by default, --all, or id prefixes
+  resume       relaunch one session in THIS terminal
+  forget       mark sessions as closed on purpose (they leave the picker)
+  prune        drop old closed/unresumable history
+  snapshot     register the sessions that are live right now
+  doctor       check the install and every Claude Code internal this depends on
+  install      copy to ~/.local/bin and add the hooks (--launchd: picker at login)
+  uninstall    remove the hooks, the login agent and the binary (--purge: the registry too)
+  hook         SessionStart/SessionEnd hook target (Claude Code pipes JSON on stdin)
+  autorestore  login agent target: one window with the picker, only if something died
+
+How "restorable" is decided (measured on Claude Code 2.1.273 to 2.1.285, macOS):
+  terminal crash (SIGHUP), reboot (SIGTERM)   SessionEnd "other" / "shutdown"   restorable
+  SIGKILL, power loss                         no SessionEnd, <pid>.json lingers  restorable
+  /exit, /clear, /resume, /logout, `forget`   a deliberate end                   closed
+
+Registry: $CLAUDE_BARDO_DIR/registry.jsonl (default ~/.local/state/claude-bardo), one JSON
+event per line, schema "v": 1. See the README for the schema and the flag replay policy.
+"""
+import argparse
+import calendar
+import ctypes
+import ctypes.util
+import datetime
+import difflib
+import fcntl
+import glob
+import json
+import os
+import re
+import select
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+
+NAME = "claude-bardo"
+HOMEPAGE = "https://github.com/multiplyco/claude-bardo"
+__version__ = "0.1.0"
+FLAGS_VERIFIED_ON = "2.1.301"    # the flag tables below match `claude --help` of this version
+SCHEMA = 1
+
+HOME = os.path.expanduser("~")
+CLAUDE_DIR = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(HOME, ".claude")
+LIVE_DIR = os.path.join(CLAUDE_DIR, "sessions")
+PROJECTS_DIR = os.path.join(CLAUDE_DIR, "projects")
+STATE_DIR = os.environ.get("CLAUDE_BARDO_DIR") or os.path.join(HOME, ".local", "state", NAME)
+REGISTRY = os.path.join(STATE_DIR, "registry.jsonl")
+LOCKFILE = os.path.join(STATE_DIR, "registry.lock")
+TRANSCRIPT_CACHE = os.path.join(STATE_DIR, "transcripts.json")
+LOG = os.path.join(STATE_DIR, "bardo.log")
+LOG_MAX = 1 << 20                # rotate the log to .1 beyond 1 MiB
+TERMINAL = os.environ.get("CLAUDE_BARDO_TERMINAL") or "ghostty"
+LAUNCHER = os.environ.get("CLAUDE_BARDO_LAUNCHER") or ""
+TMUX_SESSION = NAME
+LAUNCHD_LABEL = NAME + ".autorestore"
+
+EXIT_OK, EXIT_FAIL, EXIT_USAGE, EXIT_NOTHING = 0, 1, 2, 3
+
+DELIBERATE = {"prompt_input_exit", "logout", "clear", "resume", "bypass_permissions_disabled", "forgotten"}
+CRASH_REASONS = {"other", "shutdown"}
+RESTORABLE = {"interrupted", "killed"}
+RESTORING_TTL = 180          # seconds a "restoring" mark counts as live
+MAX_AGE_DAYS = 14            # older interruptions are hidden from restore unless --older
+WAVE_MINUTES = 30            # deaths this close to the newest one were one crash/reboot: pre-selected
+MIN_RUN_SECONDS = 5          # a relaunch that dies faster than this is reported as failed
+PS_TIME_FMT = "%a %b %d %H:%M:%S %Y"
+UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
+CAFFEINATE_FLAG_RE = re.compile(r"^-[disu]+$")   # the only caffeinate flags worth replaying
+SAFE_TOKEN_RE = re.compile(r"^[A-Za-z0-9_@%+=:,./-]+$")
+CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f\u200e\u200f\u202a-\u202e\u2066-\u2069]")
+INTERPRETERS = {"node", "bun", "deno"}
+GHOSTTY_ARGS = [
+    # Every `open -na` is a NEW Ghostty instance. Without these it replays the saved
+    # window layout (25 empty shells appeared during testing) and lingers forever.
+    "--window-save-state=never",
+    "--quit-after-last-window-closed=true",
+    "--quit-after-last-window-closed-delay=1s",
+]
+TERMINAL_APPS = {"ghostty": "Ghostty", "iterm": "iTerm", "terminal": "Terminal",
+                 "alacritty": "Alacritty", "wezterm": "WezTerm", "kitty": "kitty"}
+# process names (ps comm) of terminals and multiplexers a session can live in
+TERM_COMM_RE = re.compile(r"^(ghostty|iTerm2|iTermServer.*|Terminal|tmux.*|alacritty|wezterm-gui|kitty"
+                          r"|gnome-terminal-|konsole|xterm)$")
+
+# --- claude CLI flag knowledge, used to rebuild a clean relaunch command -------------
+VALUE_FLAGS = {
+    "--agent", "--agents", "--append-system-prompt", "--append-system-prompt-file",
+    "--autocompact", "--client-data-url", "--debug-file", "--effort", "--fallback-model",
+    "--json-schema", "--max-budget-usd", "--model", "--output-format", "--input-format",
+    "--permission-mode", "--permission-prompts", "--permission-prompt-tool", "--plugin-dir", "--plugin-url",
+    "--setting-sources",
+    "--settings", "--system-prompt", "--system-prompt-file", "--system-prompt-snapshot",
+    "--remote-control-session-name-prefix",
+}
+# free text: in lossy `ps` argv a multi-word value cannot be told apart from the prompt
+TEXT_VALUE_FLAGS = {"--agents", "--append-system-prompt", "--json-schema", "--settings", "--system-prompt"}
+VARIADIC_FLAGS = {
+    "--add-dir", "--allowedTools", "--allowed-tools", "--disallowedTools", "--disallowed-tools",
+    "--betas", "--file", "--mcp-config", "--tools",
+}
+OPTIONAL_VALUE_FLAGS = {
+    "--resume", "-r", "--debug", "-d", "--worktree", "-w", "--remote-control",
+    "--teleport", "--from-pr", "--cloud", "--prompt-suggestions",
+}
+BOOL_FLAGS = {
+    "--allow-dangerously-skip-permissions", "--ax-screen-reader", "--bare", "--brief", "--chrome",
+    "--no-chrome", "--dangerously-skip-permissions", "--disable-slash-commands",
+    "--exclude-dynamic-system-prompt-sections",
+    "--forward-subagent-text", "--ide", "--include-hook-events", "--include-partial-messages",
+    "--no-session-persistence", "--replay-user-messages", "--restricted", "--safe-mode",
+    "--strict-mcp-config", "--verbose",
+}
+# never replay these: they pick *which* session to open, create a new worktree, or are one-shot modes
+DROP_WITH_VALUE = {"--resume", "-r", "--session-id", "--name", "-n", "--teleport", "--from-pr", "--cloud",
+                   "--environment", "--worktree", "-w"}
+DROP_FLAGS = {"--continue", "-c", "--fork-session", "--bg", "--background", "--print", "-p", "--tmux", "--desktop"}
+# a relaunch never turns permission checks off unless the user asks for it (restore --keep-bypass)
+BYPASS_FLAGS = {"--dangerously-skip-permissions", "--allow-dangerously-skip-permissions"}
+BYPASS_MODE = "bypassPermissions"
+
+
+# --- small helpers -------------------------------------------------------------------
+def now_iso():
+    return datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def parse_ts(ts):
+    try:
+        return datetime.datetime.fromisoformat(ts)
+    except (TypeError, ValueError):
+        return None
+
+
+def sysbin(name):
+    """System tools by absolute path: a user-writable dir early on PATH must not shadow them."""
+    for d in ("/bin", "/usr/bin", "/usr/sbin", "/sbin"):
+        p = os.path.join(d, name)
+        if os.access(p, os.X_OK):
+            return p
+    return name
+
+
+PS, PGREP, OPEN, OSASCRIPT, LAUNCHCTL = (sysbin(n) for n in ("ps", "pgrep", "open", "osascript", "launchctl"))
+
+
+def _self_path():
+    """The path this script was started as (keeps a stable ~/.local/bin path in spawned
+    command lines), falling back to the resolved file."""
+    real = os.path.realpath(os.path.abspath(__file__))
+    argv0 = os.path.abspath(sys.argv[0]) if sys.argv and sys.argv[0] else ""
+    if argv0 and os.path.isfile(argv0) and os.path.realpath(argv0) == real:
+        return argv0
+    return real
+
+
+SELF = _self_path()
+
+
+def ensure_state():
+    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(STATE_DIR, 0o700)
+    except OSError:
+        pass
+
+
+def open_private(path, flags):
+    """An fd for a state file that only its owner can read (0600, fixed up if it was not)."""
+    fd = os.open(path, flags | os.O_CREAT, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+    except OSError:
+        pass
+    return fd
+
+
+class registry_lock:
+    """flock on a sidecar file: hooks append, prune rewrites, restore reads-then-marks."""
+
+    def __enter__(self):
+        ensure_state()
+        self.fd = open_private(LOCKFILE, os.O_RDWR)
+        fcntl.flock(self.fd, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc):
+        fcntl.flock(self.fd, fcntl.LOCK_UN)
+        os.close(self.fd)
+
+
+def log(msg):
+    try:
+        ensure_state()
+        if os.path.exists(LOG) and os.path.getsize(LOG) > LOG_MAX:
+            os.replace(LOG, LOG + ".1")
+        fd = open_private(LOG, os.O_WRONLY | os.O_APPEND)
+        try:
+            os.write(fd, "{} {}\n".format(now_iso(), clean(msg, 2000)).encode("utf-8"))
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+
+
+def append(rec):
+    """One event, one os.write, under the registry lock. A torn last line (crash mid-write)
+    gets its newline first, so it cannot swallow this record."""
+    rec = dict({"v": SCHEMA}, **rec)
+    data = (json.dumps(rec, ensure_ascii=False) + "\n").encode("utf-8")
+    with registry_lock():
+        fd = open_private(REGISTRY, os.O_RDWR | os.O_APPEND)
+        try:
+            size = os.fstat(fd).st_size
+            if size and os.pread(fd, 1, size - 1) != b"\n":
+                data = b"\n" + data
+            os.write(fd, data)
+        finally:
+            os.close(fd)
+
+
+def run(cmd, **kw):
+    kw.setdefault("stdout", subprocess.PIPE)
+    kw.setdefault("stderr", subprocess.DEVNULL)
+    kw.setdefault("text", True)
+    kw.setdefault("env", dict(os.environ, LC_ALL="C"))   # ps dates parse the same everywhere
+    try:
+        return subprocess.run(cmd, **kw).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def ps(field, pid):
+    out = run([PS, "-ww", "-o", "{}=".format(field), "-p", str(pid)])
+    out = (out or "").strip()
+    return out or None
+
+
+def _argv_sysctl(pid):
+    """Exact argv of a process via sysctl(KERN_PROCARGS2): NUL-separated, so a quoted
+    prompt stays one token. macOS only; None on any failure."""
+    if sys.platform != "darwin":
+        return None
+    try:
+        libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+        libc.sysctl.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_uint, ctypes.c_void_p,
+                                ctypes.POINTER(ctypes.c_size_t), ctypes.c_void_p, ctypes.c_size_t]
+        CTL_KERN, KERN_ARGMAX, KERN_PROCARGS2 = 1, 8, 49
+        argmax = ctypes.c_int(0)
+        size = ctypes.c_size_t(ctypes.sizeof(argmax))
+        mib2 = (ctypes.c_int * 2)(CTL_KERN, KERN_ARGMAX)
+        if libc.sysctl(mib2, 2, ctypes.byref(argmax), ctypes.byref(size), None, 0) != 0 or argmax.value <= 0:
+            return None
+        buf = ctypes.create_string_buffer(argmax.value)
+        size = ctypes.c_size_t(argmax.value)
+        mib3 = (ctypes.c_int * 3)(CTL_KERN, KERN_PROCARGS2, int(pid))
+        if libc.sysctl(mib3, 3, buf, ctypes.byref(size), None, 0) != 0:
+            return None
+        raw = buf.raw[:size.value]
+        argc = int.from_bytes(raw[:4], sys.byteorder)
+        rest = raw[4:]
+        nul = rest.find(b"\0")                 # exec path, then NUL padding, then argv
+        if nul < 0 or argc <= 0:
+            return None
+        parts = rest[nul:].lstrip(b"\0").split(b"\0")
+        if len(parts) < argc:
+            return None
+        return [p.decode("utf-8", "replace") for p in parts[:argc]]
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _argv_procfs(pid):
+    """Exact argv on Linux: /proc/<pid>/cmdline is NUL-separated."""
+    try:
+        with open("/proc/{}/cmdline".format(int(pid)), "rb") as f:
+            raw = f.read()
+    except (OSError, ValueError):
+        return None
+    parts = raw.split(b"\0")
+    if parts and parts[-1] == b"":
+        parts = parts[:-1]
+    return [p.decode("utf-8", "replace") for p in parts] or None
+
+
+def proc_argv(pid):
+    """(argv, exact). exact=True comes from the kernel; False means it was rebuilt from
+    `ps -o args`, which joins argv with spaces and loses quoting."""
+    argv = _argv_sysctl(pid) or _argv_procfs(pid)
+    if argv:
+        return argv, True
+    out = ps("args", pid)
+    return (out.split(), False) if out else (None, False)
+
+
+def strip_interpreter(argv):
+    """[node, /…/claude-code/cli.js, --flag…] -> [/…/cli.js, --flag…]: npm installs run
+    claude as a script, so the flags start one token later."""
+    argv = list(argv or [])
+    if len(argv) > 1 and os.path.basename(argv[0]) in INTERPRETERS:
+        return argv[1:]
+    return argv
+
+
+def is_claude_argv(argv):
+    argv = strip_interpreter(argv)
+    if not argv:
+        return False
+    head = argv[0]
+    return os.path.basename(head) == "claude" or "claude-code" in head or "/claude/" in head
+
+
+def children(pid):
+    out = run([PGREP, "-P", str(pid)])
+    return [int(x) for x in (out or "").split() if x.isdigit()]
+
+
+def alive(pid):
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
+def proc_matches(pid, proc_start):
+    """True if `pid` is alive AND is the same process that wrote procStart (guards PID reuse).
+    Fails open (True: treated as live, never relaunched) when the start time is unreadable."""
+    if not alive(pid):
+        return False
+    lstart = ps("lstart", pid)
+    if not lstart or not proc_start:
+        return True
+    try:
+        seen = time.mktime(time.strptime(lstart, PS_TIME_FMT))
+        st = time.strptime(proc_start.strip(), PS_TIME_FMT)
+        # Claude writes procStart in UTC; our own records hold a local-time reading.
+        return min(abs(seen - calendar.timegm(st)), abs(seen - time.mktime(st))) <= 3
+    except (ValueError, OverflowError, AttributeError):
+        return True
+
+
+def is_claude_pid(pid):
+    comm = os.path.basename(ps("comm", pid) or "")
+    if comm == "claude":
+        return True
+    if comm in INTERPRETERS:
+        return is_claude_argv(proc_argv(pid)[0])
+    return False
+
+
+def pid_is_claude(pid, proc_start):
+    """The recorded claude process is still running; its start time guards against PID
+    reuse (after a reboot low PIDs come back quickly)."""
+    if not pid or not proc_start or not proc_matches(pid, proc_start):
+        return False
+    return is_claude_pid(pid)
+
+
+def find_claude_pid():
+    """Fallback when CLAUDE_PID is missing: the hook is a descendant of claude."""
+    pid = os.getppid()
+    for _ in range(8):
+        if pid <= 1:
+            return None
+        if is_claude_pid(pid):
+            return pid
+        ppid = ps("ppid", pid)
+        if not ppid or not ppid.isdigit():
+            return None
+        pid = int(ppid)
+    return None
+
+
+def proc_table():
+    """{pid: (ppid, comm, lstart)} for every process, from one ps call; {} on failure."""
+    out = run([PS, "-A", "-ww", "-o", "pid=,ppid=,lstart=,comm="], timeout=2)
+    table = {}
+    for line in (out or "").splitlines():
+        parts = line.split(None, 2)
+        if len(parts) < 3 or not parts[0].isdigit() or not parts[1].isdigit():
+            continue
+        lstart, comm = parts[2][:24], parts[2][24:].strip()   # lstart is ctime(3): always 24 chars
+        table[int(parts[0])] = (int(parts[1]), os.path.basename(comm) or comm, lstart)
+    return table
+
+
+def ancestry(pid, table):
+    """[[pid, comm, lstart], ...] above `pid`, nearest first, up to (not including) pid 1."""
+    chain, seen = [], set()
+    cur = table.get(pid, (None,))[0]
+    while cur and cur > 1 and cur not in seen and len(chain) < 12:
+        seen.add(cur)
+        ppid, comm, lstart = table.get(cur, (None, None, None))
+        if comm is None:
+            break
+        chain.append([cur, comm, lstart])
+        cur = ppid
+    return chain
+
+
+def where_am_i():
+    """Measurement for openspec/changes/window-close-is-deliberate, read by nothing yet: the
+    hook's ancestors (claude, shell, terminal) and every terminal alive right now. Recorded at
+    start and end so a closed window can be told apart from a quit, a crash or a reboot."""
+    try:
+        table = proc_table()
+        if not table:
+            return None
+        terms = [[p, c, s] for p, (_, c, s) in sorted(table.items()) if TERM_COMM_RE.match(c)]
+        return {"anc": ancestry(os.getpid(), table), "terms": terms}
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def caffeinate_args(pid, claude_argv=None):
+    """`caffeinate -s -i -- claude …` forks and the parent execs claude, so the wrapper is
+    claude's CHILD and carries claude's whole command line after `--`. Claude Code also
+    spawns its own transient `caffeinate -i -t 300` while busy, so match on that tail and
+    never on "first caffeinate child". Returns the wrapper flags or None."""
+    want = strip_interpreter(claude_argv)[1:] if claude_argv else None
+    for c in children(pid):
+        comm = ps("comm", c) or ""
+        if os.path.basename(comm) != "caffeinate":
+            continue
+        args, _ = proc_argv(c)
+        if not args or "--" not in args:
+            continue
+        k = args.index("--")
+        flags, tail = args[1:k], args[k + 1:]
+        if not tail or not is_claude_argv(tail):
+            continue
+        if want is not None and strip_interpreter(tail)[1:] != want:
+            continue
+        if all(CAFFEINATE_FLAG_RE.match(f) for f in flags):
+            return flags
+    return None
+
+
+def claude_version():
+    tag = os.environ.get("AI_AGENT", "")  # e.g. claude-code_2-1-273_harness
+    if tag.startswith("claude-code_"):
+        return tag.split("_")[1].replace("-", ".")
+    return None
+
+
+def valid_id(sid):
+    return isinstance(sid, str) and UUID_RE.fullmatch(sid) is not None
+
+
+def clean(text, limit=80):
+    """Names come from users, models and transcripts: strip control characters before
+    they reach a terminal or a picker."""
+    if not text:
+        return ""
+    text = CONTROL_RE.sub("", str(text))
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def tilde(path):
+    path = clean(path, 240) if isinstance(path, str) else ""
+    if path and (path == HOME or path.startswith(HOME + os.sep)):
+        return "~" + path[len(HOME):]
+    return path or "?"
+
+
+class Progress:
+    """A spinner on stderr while work runs, so a command never looks hung. Drawn only on a
+    terminal, from the start (or once the work has taken `delay` seconds); erased on exit,
+    before the command prints its results."""
+    FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+    def __init__(self, label, total=None, delay=0):
+        self.label, self.total, self.delay, self.done = label, total, delay, 0
+        self.out, self.stop, self.drawn, self.thread = sys.stderr, threading.Event(), False, None
+        try:
+            self.on = bool(self.out and self.out.isatty()) and os.environ.get("TERM") != "dumb"
+        except (ValueError, OSError):
+            self.on = False
+
+    def step(self, n=1):
+        self.done += n
+
+    def _draw(self, text):
+        try:
+            self.out.write(text)
+            self.out.flush()
+        except (ValueError, OSError):
+            self.on = False
+
+    def _spin(self):
+        if self.stop.wait(self.delay):
+            return
+        i = 0
+        while self.on:
+            count = " {}/{}".format(self.done, self.total) if self.total else ""
+            self._draw("\r{} {}{}\x1b[K".format(self.FRAMES[i % len(self.FRAMES)], self.label, count))
+            self.drawn, i = True, i + 1
+            if self.stop.wait(0.1):
+                return
+
+    def __enter__(self):
+        if self.on:
+            self.thread = threading.Thread(target=self._spin, daemon=True)
+            self.thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        if self.thread:
+            self.stop.set()
+            self.thread.join()
+            if self.drawn:
+                self._draw("\r\x1b[K")
+
+
+def age(ts):
+    then = parse_ts(ts)
+    if then is None:
+        return "?"
+    secs = (datetime.datetime.now().astimezone() - then).total_seconds()
+    for unit, div in (("d", 86400), ("h", 3600), ("m", 60)):
+        if secs >= div:
+            return "{}{}".format(int(secs // div), unit)
+    return "{}s".format(int(secs))
+
+
+def age_days(ts):
+    then = parse_ts(ts)
+    return (datetime.datetime.now().astimezone() - then).total_seconds() / 86400 if then else 0
+
+
+_BOOT = []
+
+
+def boot_time():
+    """This boot's start, or None. Cached: it does not change while we run."""
+    if not _BOOT:
+        t = None
+        try:
+            if sys.platform == "darwin":
+                m = re.search(r"sec = (\d+)", run([sysbin("sysctl"), "-n", "kern.boottime"]) or "")
+                t = int(m.group(1)) if m else None
+            elif os.path.exists("/proc/stat"):
+                with open("/proc/stat") as f:
+                    t = next((int(l.split()[1]) for l in f if l.startswith("btime ")), None)
+        except (OSError, ValueError):
+            t = None
+        _BOOT.append(datetime.datetime.fromtimestamp(t).astimezone() if t else None)
+    return _BOOT[0]
+
+
+def sh_quote(parts):
+    return " ".join(shlex.quote(p) for p in parts)
+
+
+def sh_display(parts):
+    """sh_quote for terminal display: a token carrying control or bidi characters is shown
+    escaped (ascii repr) so it cannot drive the terminal; pasteable for every sane path."""
+    return " ".join(ascii(p) if CONTROL_RE.search(p) else shlex.quote(p) for p in parts)
+
+
+def id_width(ids):
+    """Shortest prefix length (min 8) that keeps every id in the list unique: UUIDv7 ids
+    share their first 8 hex digits when started within a minute of each other."""
+    ids = set(ids)
+    n = 8
+    while n < 36 and len({i[:n] for i in ids}) < len(ids):
+        n += 1
+    return n
+
+
+def pause(seconds=60, prompt="press Enter to close this window"):
+    """Keep a spawned window readable after a failure; never block a non-tty caller."""
+    if not sys.stdin or not sys.stdin.isatty():
+        time.sleep(min(seconds, 8))
+        return
+    print("\n{} (auto-closes in {}s)".format(prompt, seconds))
+    try:
+        select.select([sys.stdin], [], [], seconds)
+    except (OSError, ValueError):
+        time.sleep(min(seconds, 8))
+
+
+# --- registry -------------------------------------------------------------------------
+def read_registry():
+    """Fold the JSONL into {session_id: {"start", "last", "restoring", "failed"}}.
+    Unknown fields and unknown event types are ignored (forward compatible)."""
+    state = {}
+    if not os.path.exists(REGISTRY):
+        return state
+    with open(REGISTRY, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(rec, dict):
+                continue
+            sid = rec.get("session_id")
+            if not valid_id(sid):
+                continue
+            st = state.setdefault(sid, {"start": None, "last": None, "restoring": None, "failed": None})
+            ev = rec.get("event")
+            if ev == "start":
+                st["start"] = rec
+                st["last"] = rec
+            elif ev == "end":
+                st["last"] = rec
+            elif ev == "restoring":
+                st["restoring"] = rec
+            elif ev == "launch-failed":
+                st["failed"] = rec
+    return state
+
+
+def live_sessions():
+    """Claude Code's own per-process registry. Returns (live, stale): stale = the pid is
+    gone but the file lingered, which only happens on SIGKILL / power loss."""
+    live, stale = [], []
+    for path in glob.glob(os.path.join(glob.escape(LIVE_DIR), "*.json")):
+        try:
+            with open(path, encoding="utf-8") as f:
+                d = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if not isinstance(d, dict) or not valid_id(d.get("sessionId")):
+            continue
+        if d.get("kind") not in (None, "interactive"):
+            continue
+        d["_path"] = path
+        (live if proc_matches(d.get("pid"), d.get("procStart")) else stale).append(d)
+    return live, stale
+
+
+def running_claude_ids():
+    """Session ids named in the argv of running claude processes (--resume/--session-id).
+    Second liveness signal for restored sessions, independent of ~/.claude/sessions
+    (a claude launched inside an `open -na Ghostty` window does not write its <pid>.json)."""
+    ids = set()
+    for line in (run([PS, "-axww", "-o", "args="]) or "").splitlines():
+        parts = line.split()
+        if not parts or not is_claude_argv(parts[:2]):
+            continue
+        for i, a in enumerate(parts):
+            if a in ("--resume", "-r", "--session-id") and i + 1 < len(parts):
+                ids.add(parts[i + 1])
+            elif a.startswith(("--resume=", "--session-id=")):
+                ids.add(a.split("=", 1)[1])
+    return ids
+
+
+def transcript_path(sid, rec=None):
+    p = (rec or {}).get("transcript")
+    if isinstance(p, str) and os.path.exists(p):
+        return p
+    hits = glob.glob(os.path.join(glob.escape(PROJECTS_DIR), "*", "{}.jsonl".format(sid)))
+    if not hits:
+        return None
+    return max(hits, key=lambda h: os.path.getmtime(h) if os.path.exists(h) else 0)
+
+
+class TranscriptCache:
+    """How far each transcript has been read, and what that found. Transcripts only grow, so
+    the next read starts where the last one stopped: one that shrank, was replaced (another
+    inode) or no longer ends in the bytes it ended in is read again from the start."""
+    MARK = 32               # bytes before the offset that must still be there
+
+    def __init__(self, path):
+        self.path, self.files, self.dirty = path, None, False
+
+    def _load(self):
+        self.files = {}
+        try:
+            with open(self.path, encoding="utf-8") as f:
+                d = json.load(f)
+            if isinstance(d, dict) and d.get("v") == 1 and isinstance(d.get("files"), dict):
+                self.files = d["files"]
+        except (OSError, ValueError):
+            pass
+
+    def resume(self, f, path, st):
+        """(offset, meta so far) for an open transcript: where to continue, or (0, None)."""
+        if self.files is None:
+            self._load()
+        e = self.files.get(path)
+        if not isinstance(e, dict) or e.get("ino") != st.st_ino:
+            return 0, None
+        off, mark = e.get("off"), e.get("mark")
+        if not isinstance(off, int) or not 0 < off <= st.st_size or not isinstance(mark, str):
+            return 0, None
+        start = max(off - self.MARK, 0)
+        f.seek(start)
+        if f.read(off - start).hex() != mark:
+            return 0, None
+        cwd = e.get("cwd")
+        return off, {"cwd": cwd if isinstance(cwd, str) else None,
+                     "custom_title": e.get("custom_title"), "ai_title": e.get("ai_title")}
+
+    def remember(self, path, st, off, mark, meta):
+        e = dict(meta, ino=st.st_ino, off=off, mark=mark.hex())
+        if self.files is None:
+            self._load()
+        if self.files.get(path) != e:
+            self.files[path] = e
+            self.dirty = True
+
+    def save(self):
+        """Write it back if this run changed it, without transcripts that are gone. Best effort:
+        a cache that cannot be written only costs the next run a full read."""
+        if not self.dirty:
+            return
+        files = {p: e for p, e in self.files.items() if os.path.exists(p)}
+        tmp = "{}.{}.tmp".format(self.path, os.getpid())
+        try:
+            ensure_state()
+            with os.fdopen(open_private(tmp, os.O_WRONLY | os.O_TRUNC), "w", encoding="utf-8") as f:
+                json.dump({"v": 1, "files": files}, f, ensure_ascii=False)
+            os.replace(tmp, self.path)
+            self.dirty = False
+        except OSError:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+
+TRANSCRIPTS = TranscriptCache(TRANSCRIPT_CACHE)
+
+
+def _fold_line(meta, raw):
+    """Fold one transcript line into meta. Only lines carrying a marker are decoded."""
+    if meta["cwd"] is None and b'"cwd":' in raw:
+        try:
+            cwd = json.loads(raw.decode("utf-8", "replace")).get("cwd")
+            meta["cwd"] = cwd if isinstance(cwd, str) else None
+        except (ValueError, AttributeError):
+            pass
+    if b'"custom-title"' in raw:
+        try:
+            meta["custom_title"] = json.loads(raw.decode("utf-8", "replace")).get("customTitle") or meta["custom_title"]
+        except (ValueError, AttributeError):
+            pass
+    elif b'"ai-title"' in raw:
+        try:
+            meta["ai_title"] = json.loads(raw.decode("utf-8", "replace")).get("aiTitle") or meta["ai_title"]
+        except (ValueError, AttributeError):
+            pass
+
+
+def transcript_meta(path):
+    """cwd (first message), last custom (user) title, last AI title. Message bodies are
+    never extracted: only top-level fields of lines that carry these markers. Only what was
+    appended since the last read is read (TranscriptCache)."""
+    meta = {"cwd": None, "custom_title": None, "ai_title": None}
+    if not path:
+        return meta
+    partial = b""
+    try:
+        with open(path, "rb") as f:
+            st = os.fstat(f.fileno())
+            off, seen = TRANSCRIPTS.resume(f, path, st)
+            meta.update(seen or {})
+            f.seek(off)
+            mark = b""
+            for raw in f:
+                if not raw.endswith(b"\n"):
+                    partial = raw          # still being written: in this answer, read again next time
+                    break
+                off += len(raw)
+                mark = raw[-TranscriptCache.MARK:] if len(raw) >= TranscriptCache.MARK else (mark + raw)[-TranscriptCache.MARK:]
+                _fold_line(meta, raw)
+            if off and not mark:           # nothing new: the mark is still the bytes before off
+                f.seek(max(off - TranscriptCache.MARK, 0))
+                mark = f.read(off - max(off - TranscriptCache.MARK, 0))
+    except OSError:
+        return meta
+    if off:
+        TRANSCRIPTS.remember(path, st, off, mark, meta)
+    if partial:
+        meta = dict(meta)
+        _fold_line(meta, partial)
+    return meta
+
+
+class Session:
+    def __init__(self, sid, status, start, last, note="", restoring=None, failed=None):
+        self.id, self.status, self.start, self.last, self.note = sid, status, start or {}, last or {}, note
+        self.lingering = False             # Claude Code's pid file outlived the process (SIGKILL, power loss)
+        self.transcript = transcript_path(sid, self.start)
+        self.meta = transcript_meta(self.transcript)
+        cwd = self.start.get("cwd")
+        self.cwd = cwd if isinstance(cwd, str) and cwd else self.meta["cwd"]
+        if status in RESTORABLE:
+            if not self.transcript:
+                self.status, self.note = "unresumable", "transcript missing"
+            elif not self.cwd or not os.path.isdir(self.cwd):
+                self.status, self.note = "unresumable", "cwd gone: {}".format(clean(self.cwd, 200))
+        if self.status in RESTORABLE:
+            now = datetime.datetime.now().astimezone()
+            last_t = parse_ts(self.ts) or datetime.datetime.fromtimestamp(0).astimezone()
+            r_t = parse_ts((restoring or {}).get("ts"))
+            f_t = parse_ts((failed or {}).get("ts"))
+            if r_t and r_t >= last_t and (not f_t or f_t < r_t):   # same second as the last write still counts
+                r_age = (now - r_t).total_seconds()
+                if r_age < RESTORING_TTL:
+                    self.status, self.note = "restoring", "relaunch in progress ({}s ago)".format(int(r_age))
+            elif f_t and f_t >= last_t:
+                rc = failed.get("rc")
+                self.note = "last relaunch failed rc={} {} ago".format(rc if isinstance(rc, int) else "?", age(failed.get("ts")))
+
+    @property
+    def name(self):
+        s = self.start
+        if self.meta["custom_title"]:
+            return clean(self.meta["custom_title"])
+        if s.get("name") and s.get("name_source") in ("user", "title"):
+            return clean(s["name"])
+        if self.meta["ai_title"]:
+            return clean(self.meta["ai_title"])
+        return clean(s.get("name") or os.path.basename(self.cwd or "") or "?")
+
+    @property
+    def ts(self):
+        """When the session was last seen. Without an end record (live, killed, stale file)
+        that is the transcript's last write, not the session's start: a session that ran for
+        three weeks and died today died today."""
+        t = self.last.get("ts") or self.start.get("ts") or ""
+        if self.last.get("event") != "end" and self.transcript:
+            try:
+                mt = datetime.datetime.fromtimestamp(os.path.getmtime(self.transcript)).astimezone()
+                pt = parse_ts(t)
+                if pt is None or mt > pt:
+                    return mt.isoformat(timespec="seconds")
+            except (OSError, OverflowError, ValueError):
+                pass
+        return t if isinstance(t, str) else ""
+
+    @property
+    def died(self):
+        """When it died, to group deaths into waves: the SessionEnd's time; for a session that
+        left none but a pid file from before this boot, the boot (it was alive until then)."""
+        if self.last.get("event") == "end":
+            t = parse_ts(self.last.get("ts"))
+            if t:
+                return t
+        seen, boot = parse_ts(self.ts), boot_time()
+        if self.lingering and boot and (seen is None or seen < boot):
+            return boot
+        return seen or datetime.datetime.fromtimestamp(0).astimezone()
+
+    @property
+    def bypass(self):
+        """The permission-bypass flags this session was started with (never replayed by default)."""
+        dropped = []
+        argv = self.start.get("argv") or ["claude"]
+        sanitize_argv(list(argv[1:]), exact=True, dropped=dropped)
+        return [tok for tok, why in dropped if why == "bypass"]
+
+
+def pidfile_ts(d):
+    """Start time of a ~/.claude/sessions entry as ISO: startedAt (ms) or procStart (UTC)."""
+    try:
+        if d.get("startedAt"):
+            return datetime.datetime.fromtimestamp(d["startedAt"] / 1000).astimezone().isoformat(timespec="seconds")
+        if d.get("procStart"):
+            epoch = calendar.timegm(time.strptime(d["procStart"].strip(), PS_TIME_FMT))
+            return datetime.datetime.fromtimestamp(epoch).astimezone().isoformat(timespec="seconds")
+    except (TypeError, ValueError, OverflowError, OSError, AttributeError):
+        pass
+    return None
+
+
+def end_status(reason):
+    """(status, note) for a SessionEnd reason. Unknown reasons stay restorable (losing a
+    session after a reboot is the failure this tool exists to prevent) but say so."""
+    if reason in DELIBERATE:
+        return "closed", ""
+    if reason in CRASH_REASONS or reason is None:
+        return "interrupted", ""
+    return "interrupted", "unrecognised end reason {!r}".format(clean(reason, 40))
+
+
+def all_sessions():
+    """Every session the registry and Claude Code's process files know of, newest first."""
+    with Progress("reading session transcripts") as progress:
+        state = read_registry()
+        live, stale = live_sessions()
+        progress.total = len(state) + len(stale) + len(live)
+        out = fold_sessions(state, live, stale, progress.step)
+    TRANSCRIPTS.save()
+    return out
+
+
+def fold_sessions(state, live, stale, step):
+    pidfile_live = {d["sessionId"] for d in live}
+    lingering = {d["sessionId"] for d in stale}
+    argv_live = running_claude_ids()
+    out = []
+    for sid, st in state.items():
+        step()
+        last, start = st["last"], st["start"]
+        if last is None:
+            continue                  # only restoring/launch-failed marks: joined with the pid files below
+        note = ""
+        if last.get("event") == "end":
+            # an end record is authoritative: `/clear` inside a restored window ends the old id
+            # while the process (whose argv still says --resume <old id>) lives on
+            status, note = end_status(last.get("reason"))
+        elif sid in pidfile_live or pid_is_claude(last.get("pid"), last.get("proc_start")) or sid in argv_live:
+            status = "live"
+        else:
+            status = "killed"
+        if start is None:
+            # an end without a start: a hook outage at start, or not a Claude Code CLI session
+            if status == "closed" or not transcript_path(sid):
+                continue
+            note = note or "no start record: relaunches without its original flags"
+        elif status == "killed" and start.get("source") == "snapshot":
+            note = "pre-hook session: exit reason unknown"
+        out.append(Session(sid, status, start, last, note, st["restoring"], st["failed"]))
+    for d in stale:
+        step()
+        st = state.get(d["sessionId"]) or {}
+        if st.get("last") is not None:
+            continue
+        start = {"ts": pidfile_ts(d), "event": "start", "session_id": d["sessionId"], "cwd": d.get("cwd"), "name": d.get("name"),
+                 "name_source": d.get("nameSource"), "source": "stale-live-file", "pid": d.get("pid")}
+        out.append(Session(d["sessionId"], "killed", start, start,
+                           "found via lingering ~/.claude/sessions file; relaunches without original flags",
+                           st.get("restoring"), st.get("failed")))
+    for d in live:
+        step()
+        st = state.get(d["sessionId"]) or {}
+        if st.get("last") is not None:
+            continue
+        start = {"ts": pidfile_ts(d) or now_iso(), "event": "start", "session_id": d["sessionId"], "cwd": d.get("cwd"),
+                 "name": d.get("name"), "name_source": d.get("nameSource"), "source": "live-unregistered", "pid": d.get("pid")}
+        out.append(Session(d["sessionId"], "live", start, start, "not in registry yet: run `{} snapshot`".format(NAME)))
+    for s in out:
+        s.lingering = s.id in lingering
+    out.sort(key=lambda s: s.ts, reverse=True)
+    return out
+
+
+def latest_wave(cands):
+    """The sessions that died together with the newest death: one reboot or crash takes
+    them all within seconds. Older deaths are the windows you closed days ago."""
+    if not cands:
+        return []
+    newest = max(s.died for s in cands)
+    return [s for s in cands if (newest - s.died).total_seconds() <= WAVE_MINUTES * 60]
+
+
+# --- flag replay -----------------------------------------------------------------------
+def sanitize_argv(argv, exact=True, keep_bypass=False, keep_unknown=False, dropped=None):
+    """Rebuild the flags to replay from claude's argv (without argv[0]).
+
+    Positionals are never replayed (a quoted prompt is one token in exact argv). Session
+    selectors and one-shot modes are dropped. Permission bypass is dropped unless
+    keep_bypass, and never inferred from lossy argv. Unknown flags are dropped unless
+    keep_unknown (then kept value-less: eating the next token could store a prompt).
+    Space-joined `ps` argv cannot be trusted past the first ambiguous token: stop there.
+    `dropped`, if a list, collects (token, reason) for what was not replayed."""
+    out, i = [], 0
+
+    def drop(tok, why):
+        if dropped is not None:
+            dropped.append((tok, why))
+
+    def is_value(tok):
+        return bool(tok) and not tok.startswith("-") and not any(ch.isspace() for ch in tok)
+
+    while i < len(argv):
+        a = argv[i]
+        if not isinstance(a, str):
+            break
+        if a == "--":                       # everything after is prompt text
+            break
+        key = a.split("=", 1)[0] if a.startswith("--") and "=" in a else a
+        inline = key != a
+        if key in DROP_FLAGS or (key in DROP_WITH_VALUE and inline):
+            i += 1
+            continue
+        if a in DROP_WITH_VALUE:
+            i += 1
+            if a in OPTIONAL_VALUE_FLAGS:
+                if i < len(argv) and is_value(argv[i]):
+                    i += 1
+            elif i < len(argv):
+                i += 1
+            continue
+        if key in BYPASS_FLAGS:
+            if exact and keep_bypass:
+                out.append(a)
+            else:
+                drop(a, "bypass")
+            i += 1
+            continue
+        if key in ("--permission-mode", "--settings"):
+            value = a.split("=", 1)[1] if inline else (argv[i + 1] if i + 1 < len(argv) else "")
+            width = 1 if inline else 2
+            if bypass_value(key, value) and not (exact and keep_bypass):
+                drop(key + (" " + value if key == "--permission-mode" else " <bypassPermissions>"), "bypass")
+                i += width
+                continue
+        if inline:                          # --flag=value, keep verbatim when the flag is known
+            if key in VALUE_FLAGS or key in VARIADIC_FLAGS or key in OPTIONAL_VALUE_FLAGS or key in BOOL_FLAGS:
+                out.append(a)
+                i += 1
+                continue
+            if exact and not any(ch.isspace() for ch in a):
+                if keep_unknown:
+                    out.append(key)
+                else:
+                    drop(key, "unknown")
+                i += 1
+                continue
+            break
+        if a in VARIADIC_FLAGS:
+            out.append(a)
+            i += 1
+            while i < len(argv) and is_value(argv[i]) and (exact or argv[i][0] in "/~"):
+                out.append(argv[i])         # in ps text only path-like values are unambiguous
+                i += 1
+            if not exact and i < len(argv) and is_value(argv[i]):
+                break
+            continue
+        if a in VALUE_FLAGS:
+            if i + 1 >= len(argv):
+                i += 1                      # dangling flag: nothing to replay
+                continue
+            value = argv[i + 1]
+            if not exact and a in TEXT_VALUE_FLAGS and i + 2 < len(argv) and not argv[i + 2].startswith("-"):
+                drop(a, "ambiguous")       # a multi-word value in ps text: cannot tell where it ends
+                break
+            if value != "":
+                out.extend([a, value])      # an empty value (`--model "$UNSET"`) is dropped with its flag
+            i += 2
+            continue
+        if a in OPTIONAL_VALUE_FLAGS:
+            out.append(a)
+            i += 1
+            if i < len(argv) and is_value(argv[i]):
+                if not exact:
+                    break                   # value or prompt word? cannot tell
+                out.append(argv[i])
+                i += 1
+            continue
+        if a in BOOL_FLAGS:
+            out.append(a)
+            i += 1
+            continue
+        if a.startswith("-") and exact and not any(ch.isspace() for ch in a):
+            if keep_unknown:
+                out.append(a)
+            else:
+                drop(a, "unknown")
+            i += 1                          # value-less on purpose: the next token may be a prompt
+            continue
+        if exact:
+            i += 1                          # a positional prompt: never replay it
+            continue
+        break                               # ps argv: ambiguous from here on
+    return out
+
+
+def bypass_value(key, value):
+    """--permission-mode bypassPermissions, or --settings (inline JSON or a file) that sets it."""
+    if not isinstance(value, str):
+        return False
+    if key == "--permission-mode":
+        return value == BYPASS_MODE
+    if BYPASS_MODE in value:
+        return True
+    try:
+        if os.path.isfile(value):
+            with open(value, encoding="utf-8", errors="replace") as f:
+                return BYPASS_MODE in f.read(1 << 20)
+    except (OSError, ValueError):
+        pass
+    return False
+
+
+def forked_from(argv):
+    """The session a `--resume <id> --fork-session` copy was made from, else None."""
+    argv = list(argv or [])
+    if "--fork-session" not in argv:
+        return None
+    for i, a in enumerate(argv):
+        if a in ("--resume", "-r") and i + 1 < len(argv) and valid_id(argv[i + 1]):
+            return argv[i + 1]
+        if a.startswith("--resume=") and valid_id(a.split("=", 1)[1]):
+            return a.split("=", 1)[1]
+    return None
+
+
+def record_argv(argv, exact):
+    """What the registry stores: the flags only, never positionals (a prompt typed after
+    `claude`) nor anything after `--`. Bypass and unknown flags are kept so the replay
+    policy, not the recorder, decides."""
+    argv = strip_interpreter(argv)
+    if not argv:
+        return None
+    return [argv[0]] + sanitize_argv(argv[1:], exact=exact, keep_bypass=True, keep_unknown=True)
+
+
+def build_command(s, keep_bypass=False, dropped=None, fork=False):
+    argv = s.start.get("argv") or ["claude"]
+    exe = s.start.get("claude_path")
+    if not (isinstance(exe, str) and os.path.isabs(exe) and os.access(exe, os.X_OK)):
+        exe = "claude"
+    flags = sanitize_argv(list(argv[1:]), exact=bool(s.start.get("argv_exact")), keep_bypass=keep_bypass, dropped=dropped)
+    cmd = [exe] + flags + ["--resume", s.id] + (["--fork-session"] if fork else [])
+    caff = s.start.get("caffeinate")
+    if isinstance(caff, list) and all(isinstance(f, str) and CAFFEINATE_FLAG_RE.match(f) for f in caff):
+        cmd = ["caffeinate"] + caff + ["--"] + cmd
+    elif caff is not None:
+        log("session {}: ignoring unusable caffeinate flags {!r}".format(s.id[:8], caff))
+    return cmd
+
+
+# --- terminals --------------------------------------------------------------------------
+def terminal_key(name):
+    k = os.path.basename((name or "").rstrip("/")).lower()
+    if k.endswith(".app"):
+        k = k[:-4]
+    return {"iterm2": "iterm", "apple_terminal": "terminal", "terminal.app": "terminal", "wezterm-gui": "wezterm"}.get(k, k)
+
+
+def launcher_cmd(inner, term=None):
+    """argv that opens a NEW terminal window running `inner` (a list), or (None, why)."""
+    if LAUNCHER:
+        try:
+            parts = shlex.split(LAUNCHER)
+        except ValueError as e:
+            return None, "CLAUDE_BARDO_LAUNCHER does not parse: {}".format(e)
+        if "{cmd}" not in parts:
+            return None, "CLAUDE_BARDO_LAUNCHER must contain a {cmd} token"
+        k = parts.index("{cmd}")
+        return parts[:k] + list(inner) + parts[k + 1:], None
+    key = terminal_key(term or TERMINAL)
+    if key not in TERMINAL_APPS:
+        return None, "unknown terminal {!r}; use one of {}, `restore --tmux`, or CLAUDE_BARDO_LAUNCHER".format(
+            term or TERMINAL, ", ".join(sorted(TERMINAL_APPS)))
+    if sys.platform != "darwin":
+        return None, "window mode is macOS-only; use `restore --tmux` or CLAUDE_BARDO_LAUNCHER"
+    app = TERMINAL_APPS[key]
+    if key == "ghostty":
+        return [OPEN, "-na", app, "--args"] + GHOSTTY_ARGS + ["-e"] + list(inner), None
+    if key == "alacritty":
+        return [OPEN, "-na", app, "--args", "-e"] + list(inner), None
+    if key == "wezterm":
+        return [OPEN, "-na", app, "--args", "start", "--"] + list(inner), None
+    if key == "kitty":
+        return [OPEN, "-na", app, "--args"] + list(inner), None
+    # iTerm and Terminal take the command through AppleScript. It travels as an argv item,
+    # never spliced into the script text.
+    if key == "iterm":
+        if not all(SAFE_TOKEN_RE.match(t) for t in inner):
+            return None, "iTerm needs an install path without spaces or quotes: {}".format(sh_display(list(inner)))
+        body = ['tell application "iTerm"', "activate",
+                "create window with default profile command (item 1 of argv)", "end tell"]
+        line = " ".join(inner)
+    else:
+        body = ['tell application "Terminal"', "activate", "do script (item 1 of argv)", "end tell"]
+        line = "exec " + sh_quote(list(inner))
+    cmd = [OSASCRIPT]
+    for s in ["on run argv"] + body + ["end run"]:
+        cmd += ["-e", s]
+    return cmd + [line], None
+
+
+def reaps(term=None):
+    """Only a Ghostty `open -na` instance needs reaping (its own window-close handling)."""
+    return not LAUNCHER and terminal_key(term or TERMINAL) == "ghostty"
+
+
+def tmux_name(text):
+    """tmux expands #{…} and #(…) in window names: escape every #."""
+    return clean(text, 30).replace("#", "##") or "session"
+
+
+# --- subcommands ------------------------------------------------------------------------
+def cmd_hook(_args):
+    """Never print to stdout (SessionStart stdout is injected into Claude's context) and
+    never fail: a broken hook must not break a session."""
+    try:
+        if sys.stdin is None:
+            return 0
+        data = json.load(sys.stdin)
+    except (ValueError, OSError):
+        return 0
+    try:
+        if not isinstance(data, dict):
+            return 0
+        if os.environ.get("CLAUDE_CODE_ENTRYPOINT", "cli") != "cli" or os.environ.get("CLAUDE_CODE_SESSION_ATTENDED") == "0":
+            return 0  # -p / SDK runs are not something you sit in front of
+        sid = data.get("session_id")
+        ev = data.get("hook_event_name")
+        if not valid_id(sid) or ev not in ("SessionStart", "SessionEnd") or not data.get("transcript_path"):
+            return 0  # every Claude Code session has a transcript; other tools' hooks do not
+        if "hookEventName" in data:
+            return 0  # Grok Build runs ~/.claude/settings.json hooks too, in a camelCase envelope
+        pid = os.environ.get("CLAUDE_PID")
+        pid = int(pid) if pid and pid.isdigit() else None
+        if pid is None and ev == "SessionStart":
+            pid = find_claude_pid()
+        rec = {"ts": now_iso(), "session_id": sid, "pid": pid}
+        if ev == "SessionStart":
+            argv, exact = proc_argv(pid) if pid else (None, False)
+            cwd = data.get("cwd")
+            rec.update({
+                "event": "start",
+                "cwd": cwd if isinstance(cwd, str) else None,
+                "source": data.get("source"),
+                "name": data.get("session_title"),
+                "name_source": "title" if data.get("session_title") else None,
+                "transcript": data.get("transcript_path"),
+                "argv": record_argv(argv, exact) if argv else None,
+                "argv_exact": exact,
+                "forked_from": forked_from(argv),
+                "claude_path": shutil.which("claude"),
+                "caffeinate": caffeinate_args(pid, argv) if pid else None,
+                "proc_start": ps("lstart", pid) if pid else None,
+                "term": os.environ.get("TERM_PROGRAM"),
+                "version": claude_version(),
+                "anc": (where_am_i() or {}).get("anc"),
+            })
+            append(rec)
+        else:
+            rec.update({"event": "end", "reason": data.get("reason")})
+            append(rec)   # first: the measurement below must never cost the end record
+            where = where_am_i()
+            if where:
+                append(dict({"ts": now_iso(), "event": "probe", "session_id": sid, "at": "end"}, **where))
+    except Exception as e:  # noqa: BLE001
+        log("hook error: {!r}".format(e))
+    return 0
+
+
+def cmd_snapshot(args):
+    """Register whatever is live right now, so sessions that predate the hooks (or a
+    hook outage) are known to `restore`. --force also repairs a wrong start record."""
+    state = read_registry()
+    live, _ = live_sessions()
+    n = 0
+    for d in live:
+        sid, pid = d["sessionId"], d.get("pid")
+        st = state.get(sid)
+        if st and st["last"] and st["last"].get("event") == "start" and st["last"].get("pid") == pid and not args.force:
+            continue
+        argv, exact = proc_argv(pid) if pid else (None, False)
+        append({
+            "ts": now_iso(), "event": "start", "session_id": sid, "pid": pid,
+            "cwd": d.get("cwd"), "source": "snapshot", "name": d.get("name"),
+            "name_source": d.get("nameSource"), "transcript": transcript_path(sid),
+            "argv": record_argv(argv, exact) if argv else None, "argv_exact": exact,
+            "claude_path": shutil.which("claude"),
+            "caffeinate": caffeinate_args(pid, argv) if pid else None,
+            "proc_start": d.get("procStart"),
+            "term": None, "version": d.get("version"),
+        })
+        n += 1
+    if not getattr(args, "quiet", False):
+        print("snapshot: {} session(s) registered, {} already known".format(n, len(live) - n))
+    return 0
+
+
+def session_json(s):
+    return {
+        "id": s.id, "status": s.status, "note": s.note, "name": s.name, "cwd": s.cwd, "ts": s.ts,
+        "transcript": s.transcript, "argv_exact": bool(s.start.get("argv_exact")),
+        "bypass": s.bypass, "command": build_command(s) if s.status in RESTORABLE else None,
+        "died": s.died.isoformat(timespec="seconds") if s.status in RESTORABLE else None,
+    }
+
+
+def cmd_list(args):
+    sessions = all_sessions()
+    hidden = 0
+    if not args.all:
+        hidden = sum(1 for s in sessions if s.status == "unresumable")
+        sessions = [s for s in sessions if s.status not in ("closed", "unresumable")]
+    if args.json:
+        for s in sessions:
+            print(json.dumps(session_json(s), ensure_ascii=False))
+        return 0
+    if not sessions:
+        print("nothing here yet" if not hidden else "nothing restorable or live")
+    else:
+        n = id_width(s.id for s in sessions)
+        w = min(max(max(len(s.name) for s in sessions), 4), 40)
+        print("{:<{n}}  {:<12} {:>4}  {:<{w}}  {}".format("id", "status", "age", "name", "directory", n=n, w=w))
+        for s in sessions:
+            name = s.name if len(s.name) <= w else s.name[: w - 1] + "…"
+            line = "{:<{n}}  {:<12} {:>4}  {:<{w}}  {}".format(s.id[:n], s.status, age(s.ts), name, tilde(s.cwd), n=n, w=w)
+            notes = [s.note] if s.note else []
+            if s.bypass and s.status in RESTORABLE:
+                notes.append("permission bypass not replayed without --keep-bypass")
+            if notes:
+                line += "   ({})".format("; ".join(notes))
+            print(line)
+    dead = [s for s in sessions if s.status in RESTORABLE]
+    wave = latest_wave(dead)
+    if wave and len(wave) < len(dead):
+        print("({} died together {} ago, the last crash/reboot: `{} restore` pre-selects them)".format(
+            len(wave), age(max(s.died for s in wave).isoformat()), NAME))
+    if hidden:
+        print("({} unresumable hidden: cwd or transcript gone; --all shows them, `{} prune` clears them)".format(hidden, NAME))
+    return 0
+
+
+def restorable(include_older=False, quiet=False):
+    cands = [s for s in all_sessions() if s.status in RESTORABLE]
+    if include_older:
+        return cands
+    fresh = [s for s in cands if age_days(s.ts) <= MAX_AGE_DAYS]
+    hidden = len(cands) - len(fresh)
+    if hidden and not quiet:
+        print("({} session(s) interrupted more than {} days ago hidden; --older shows them)".format(hidden, MAX_AGE_DAYS))
+    return fresh
+
+
+def fzf_preselect(total, k):
+    """fzf binds that pre-select the first k of total rows (fzf >= 0.36 has the load event)."""
+    if k <= 0:
+        return []
+    if k >= total:
+        return ["--bind=load:select-all"]
+    return ["--bind=load:first" + "+toggle+down" * k + "+first"]
+
+
+def pick(cands, keep_bypass=False, preselect=None):
+    """Interactive choice. The first `preselect` rows (default: all) start selected."""
+    k = len(cands) if preselect is None else preselect
+    n = id_width(s.id for s in cands)
+
+    def tag(s):
+        if not s.bypass:
+            return ""
+        return "   [BYPASS KEPT]" if keep_bypass else "   [bypass dropped]"
+
+    lines = ["{}\t{}\t{:<11}\t{:>4}\t{}\t{}{}".format(s.id, s.id[:n], s.status, age(s.ts), s.name, tilde(s.cwd), tag(s))
+             for s in cands]
+    by_id = {s.id: s for s in cands}
+    if shutil.which("fzf"):
+        header = ("{} · TAB toggles · ENTER restores · ESC aborts\n".format(
+                      "all pre-selected" if k >= len(cands) else
+                      "{} from the last crash/reboot pre-selected, {} older below".format(k, len(cands) - k)) +
+                  "interrupted = terminal died / reboot   killed = no clean exit on record (kill -9 counts)")
+        if keep_bypass and any(s.bypass for s in cands):
+            header += "\n[BYPASS KEPT] sessions relaunch with permission checks OFF"
+        base = ["fzf", "--multi", "--reverse", "--delimiter=\t", "--with-nth=2..", "--header=" + header,
+                "--prompt={} restore> ".format(NAME)]
+        for binds in (fzf_preselect(len(cands), k), []):   # fzf < 0.36 has no `load` event
+            try:
+                p = subprocess.run(base + binds, input="\n".join(lines), stdout=subprocess.PIPE, text=True)
+            except OSError:
+                break
+            if p.returncode == 2 and binds:
+                continue
+            if p.returncode != 0:
+                return []
+            chosen = {l.split("\t", 1)[0] for l in p.stdout.splitlines() if l.strip()}
+            return [s for s in cands if s.id in chosen]
+    if shutil.which("gum"):
+        shown = ["\t".join(l.split("\t")[1:]) for l in lines]
+        sel = "*" if k >= len(cands) else ",".join(shown[:k])
+        out = run(["gum", "choose", "--no-limit", "--selected=" + sel] + shown, stderr=None, env=None)
+        chosen = set((out or "").splitlines())
+        return [by_id[l.split("\t", 1)[0]] for l in lines if "\t".join(l.split("\t")[1:]) in chosen]
+    for i, l in enumerate(lines):
+        print("{} {}".format("*" if i < k else " ", "  ".join(l.split("\t")[1:])))
+    ask = "restore all {}? [Y/n] ".format(len(cands)) if k >= len(cands) else \
+        "restore the {} marked * (last crash/reboot)? [Y/n/a = all {}] ".format(k, len(cands))
+    try:
+        ans = input(ask).strip().lower()
+    except EOFError:
+        ans = "n"
+    if ans in ("a", "all"):
+        return cands
+    return cands[:k] if ans in ("", "y", "yes") else []
+
+
+def mark_restoring(s):
+    append({"ts": now_iso(), "event": "restoring", "session_id": s.id})
+
+
+def match_prefixes(cands, prefixes):
+    """Each prefix must be at least 4 chars and identify exactly one candidate."""
+    sel, errors = [], []
+    for w in prefixes:
+        w = (w or "").strip().lower()
+        if len(w) < 4:
+            errors.append("prefix too short (min 4 chars): {!r}".format(w))
+            continue
+        hits = [s for s in cands if s.id.lower().startswith(w)]
+        if not hits:
+            errors.append("no restorable session matches {}".format(w))
+        elif len(hits) > 1:
+            n = id_width(s.id for s in hits)
+            errors.append("{} matches {} sessions ({}); be more specific".format(w, len(hits), ", ".join(s.id[:n] for s in hits)))
+        elif hits[0] not in sel:
+            sel.append(hits[0])
+    return sel, errors
+
+
+def env_prefix():
+    """`open -na` and AppleScript start the new window WITHOUT our environment: carry the
+    two paths that decide which registry and which Claude config the window must use."""
+    pairs = [(k, v) for k, v, default in (
+        ("CLAUDE_CONFIG_DIR", CLAUDE_DIR, os.path.join(HOME, ".claude")),
+        ("CLAUDE_BARDO_DIR", STATE_DIR, os.path.join(HOME, ".local", "state", NAME))) if v != default]
+    return ["/usr/bin/env"] + ["{}={}".format(k, v) for k, v in pairs] if pairs else []
+
+
+def launch_inner(s, term, keep_bypass, fork=False):
+    inner = env_prefix() + [SELF, "_launch", s.id]
+    if fork:
+        inner.append("--fork")
+    if reaps(term):
+        inner.append("--reap")
+    if keep_bypass:
+        inner.append("--keep-bypass")
+    return inner
+
+
+def spawn_window(s, dry, term=None, keep_bypass=False, fork=False):
+    cmd, why = launcher_cmd(launch_inner(s, term, keep_bypass, fork), term)
+    if cmd is None:
+        print("{}: {}".format(NAME, why), file=sys.stderr)
+        return False
+    if dry:
+        print("[dry-run] {}\n           -> cd {} && {}".format(sh_display(cmd), sh_display([s.cwd]),
+                                                              sh_display(build_command(s, keep_bypass, fork=fork))))
+        return True
+    try:
+        ok = subprocess.run(cmd).returncode == 0
+    except OSError as e:
+        print("{}: {}".format(NAME, e), file=sys.stderr)
+        ok = False
+    if ok and not fork:
+        mark_restoring(s)
+    return ok
+
+
+def spawn_tmux(sessions, dry, attach=True, term=None, keep_bypass=False, fork=False):
+    if not shutil.which("tmux"):
+        print("tmux not installed", file=sys.stderr)
+        return False
+    target = "=" + TMUX_SESSION           # exact match; a bare name is a prefix match in tmux
+    have = False if dry else subprocess.run(["tmux", "has-session", "-t", target],
+                                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+    ok = True
+    for s in sessions:
+        print("↺ {}  {}  ({})".format(s.id[:8], s.name, tilde(s.cwd)))
+        # no -c: tmux expands formats (#(…) runs a shell) in -c and -n; _launch does the chdir
+        inner = sh_quote(env_prefix() + [SELF, "_launch", s.id] + (["--keep-bypass"] if keep_bypass else [])
+                         + (["--fork"] if fork else []))
+        if not have:
+            cmd = ["tmux", "new-session", "-d", "-s", TMUX_SESSION, "-n", tmux_name(s.name), inner]
+        else:
+            cmd = ["tmux", "new-window", "-d", "-t", target, "-n", tmux_name(s.name), inner]
+        if dry:
+            print("[dry-run] {}".format(sh_display(cmd)))
+            have = True
+            continue
+        if subprocess.run(cmd).returncode == 0:
+            have = True
+            if not fork:
+                mark_restoring(s)
+        else:
+            print("tmux failed for {}  {}".format(s.id[:8], s.name), file=sys.stderr)
+            ok = False
+    if os.environ.get("TMUX"):
+        print("windows added to tmux session '{}'; switch with: tmux switch-client -t {}".format(TMUX_SESSION, target))
+    elif not attach:
+        print("windows added to tmux session '{}'; attach with: tmux attach -t {}".format(TMUX_SESSION, target))
+    else:
+        cmd, why = launcher_cmd(env_prefix() + [SELF, "_attach", TMUX_SESSION] + (["--reap"] if reaps(term) else []), term)
+        if dry and cmd:
+            print("[dry-run] {}".format(sh_display(cmd)))
+        elif cmd is None or subprocess.run(cmd).returncode != 0:
+            print("could not open a terminal window ({}); attach with: tmux attach -t {}".format(why or "launcher failed", target),
+                  file=sys.stderr)
+            ok = False
+    return ok
+
+
+def cmd_restore(args):
+    rc = EXIT_OK
+    term = args.terminal
+    if not args.tmux:
+        _, why = launcher_cmd(["true"], term)
+        if why:
+            print("{}: {}".format(NAME, why), file=sys.stderr)
+            return EXIT_USAGE
+    fork = getattr(args, "fork", False)
+    if fork:        # a copy of each running session under a new id: rehearse a restore, originals untouched
+        cands = [s for s in all_sessions() if s.status == "live" and s.transcript and s.cwd and os.path.isdir(s.cwd)]
+    else:
+        cands = restorable(include_older=args.older or bool(args.ids))
+    if args.ids:
+        sel, errors = match_prefixes(cands, args.ids)
+        for e in errors:
+            print(e, file=sys.stderr)
+        rc = EXIT_FAIL if errors else EXIT_OK
+    elif not cands:
+        print("nothing to fork: no live session with a transcript" if fork else
+              "nothing to restore: every registered session is live or was closed on purpose")
+        sel = []
+        rc = EXIT_NOTHING
+    elif args.all:
+        sel = cands
+    elif fork:
+        sel = pick(cands, args.keep_bypass)
+        if not sel:
+            print("nothing selected")
+            rc = EXIT_NOTHING
+    else:
+        wave = latest_wave(cands)
+        ids = {s.id for s in wave}
+        ordered = sorted(wave, key=lambda s: s.died, reverse=True) + [s for s in cands if s.id not in ids]
+        sel = pick(ordered, args.keep_bypass, preselect=len(wave))
+        if not sel:
+            print("nothing selected")
+            rc = EXIT_NOTHING
+    if sel and args.dry_run:
+        if args.tmux:
+            spawn_tmux(sel, True, not args.no_attach, term, args.keep_bypass, fork)
+        else:
+            for s in sel:
+                print("↺ {}  {}  ({})".format(s.id[:8], s.name, tilde(s.cwd)))
+                spawn_window(s, True, term, args.keep_bypass, fork)
+    elif sel:
+        ensure_state()
+        with os.fdopen(open_private(os.path.join(STATE_DIR, "restore.lock"), os.O_RDWR), "r+") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)   # autorestore + a manual restore must not both spawn
+            # the picker may have been open for a while: drop anything resumed or restored meanwhile
+            fresh = {s.id for s in cands} if fork else {s.id for s in restorable(include_older=True, quiet=True)}
+            for s in [s for s in sel if s.id not in fresh]:
+                print("skip {}  {}: no longer restorable (live, restoring or closed since the list was built)".format(s.id[:8], s.name))
+            sel = [s for s in sel if s.id in fresh]
+            if args.tmux:
+                if not spawn_tmux(sel, False, not args.no_attach, term, args.keep_bypass, fork):
+                    rc = EXIT_FAIL
+            else:
+                for i, s in enumerate(sel):
+                    print("↺ {}  {}  ({})".format(s.id[:8], s.name, tilde(s.cwd)))
+                    if not spawn_window(s, False, term, args.keep_bypass, fork):
+                        print("  could not open a window for {}".format(s.id[:8]), file=sys.stderr)
+                        rc = EXIT_FAIL
+                    if i < len(sel) - 1:
+                        time.sleep(0.6)      # let LaunchServices breathe; 12 instances at once is a launch storm
+            fcntl.flock(lock, fcntl.LOCK_UN)
+        if fork and sel:
+            print("forks are new sessions: end them with /exit (closing a window counts as a crash), or `{} forget` them".format(NAME))
+    if args.reap:
+        reap_own_terminal()
+    return rc
+
+
+def cmd_forget(args):
+    cands = [s for s in all_sessions() if s.status in RESTORABLE | {"unresumable", "restoring"}]
+    if not args.ids and not args.forks:
+        print("{} forget: give session id prefixes, or --forks".format(NAME), file=sys.stderr)
+        return EXIT_USAGE
+    sel, errors = match_prefixes(cands, args.ids)
+    if args.forks:                      # the copies a `restore --fork` rehearsal left behind
+        sel += [s for s in cands if s.start.get("forked_from") and s not in sel]
+    for e in errors:
+        print(e, file=sys.stderr)
+    for s in sel:
+        append({"ts": now_iso(), "event": "end", "session_id": s.id, "reason": "forgotten", "pid": None})
+        print("forgot {}  {}".format(s.id[:8], s.name))
+    return EXIT_FAIL if errors else EXIT_OK
+
+
+def cmd_autorestore(_args):
+    """At login: open the picker only if the last shutdown or crash killed something. The
+    newest death wave must predate this boot (launchd also runs us when the agent is loaded)."""
+    cands = restorable(quiet=True)
+    if not cands:
+        log("autorestore: nothing to restore")
+        return EXIT_OK
+    boot, wave = boot_time(), latest_wave(cands)
+    if boot and max(s.died for s in wave) > boot + datetime.timedelta(seconds=60):
+        log("autorestore: nothing died in the last shutdown ({} restorable from since then; `{} restore`)".format(len(cands), NAME))
+        return EXIT_OK
+    inner = env_prefix() + [SELF, "restore"] + (["--reap"] if reaps() else [])   # never --keep-bypass from here
+    cmd, why = launcher_cmd(inner)
+    if cmd is None:
+        log("autorestore: {}".format(why))
+        return EXIT_FAIL
+    log("autorestore: {} candidate(s), {} in the last wave; opening picker".format(len(cands), len(latest_wave(cands))))
+    try:
+        subprocess.run(cmd)
+    except OSError as e:
+        log("autorestore: {}".format(e))
+        return EXIT_FAIL
+    return EXIT_OK
+
+
+def relaunch(hit, keep_bypass=False, reap=False, fork=False):
+    """Resume `hit` in the current terminal: chdir, rebuild the command, run it, record a failure."""
+    dropped = []
+    cmd = build_command(hit, keep_bypass, dropped, fork)
+    os.chdir(hit.cwd)
+    print("\033[2m↺ {} {}  ({})\n  {}\033[0m".format("forking" if fork else "resuming", hit.name, tilde(hit.cwd), sh_display(cmd)))
+    if fork:
+        print("\033[2m  a new session with the same history; the original keeps running. End it with /exit.\033[0m")
+    for tok, why in dropped:
+        hint = {"bypass": "pass --keep-bypass to keep it",
+                "unknown": "not a flag {} knows (checked against Claude Code {})".format(NAME, FLAGS_VERIFIED_ON),
+                "ambiguous": "its value could not be separated from the prompt"}.get(why, why)
+        print("\033[2m  not replayed: {} ({})\033[0m".format(sh_display([tok]), hint))
+    t0 = time.monotonic()
+    try:
+        rc = subprocess.call(cmd)
+    except FileNotFoundError as e:
+        print("{}: {}".format(NAME, e), file=sys.stderr)
+        rc = 127
+    ran = time.monotonic() - t0
+    if rc != 0 or ran < MIN_RUN_SECONDS:
+        if not fork:                        # a failed fork says nothing about the original
+            append({"ts": now_iso(), "event": "launch-failed", "session_id": hit.id, "rc": rc, "seconds": round(ran, 1)})
+        log("launch failed for {}: rc={} after {:.1f}s; flags {}".format(
+            hit.id[:8], rc, ran, " ".join(t for t in cmd if t.startswith("-"))))
+        print("\n\033[31m{}: relaunch of {} failed (exit {} after {:.1f}s)\033[0m\n  {}\n  the session stays restorable; `{} forget {}` drops it"
+              .format(NAME, hit.name, rc, ran, sh_display(cmd), NAME, hit.id[:8]), file=sys.stderr)
+        pause(120)
+    if reap:
+        reap_own_terminal()
+    return rc
+
+
+def cmd_launch(args):
+    """Runs INSIDE the freshly opened terminal window."""
+    sid = args.id
+    if not valid_id(sid):
+        print("{}: not a session id: {!r}".format(NAME, sid), file=sys.stderr)
+        pause(20)
+        return EXIT_USAGE
+    hit = next((s for s in all_sessions() if s.id == sid), None)
+    allowed = RESTORABLE | {"restoring"} | ({"live"} if args.fork else set())
+    if hit is None or hit.status not in allowed or not hit.cwd or not os.path.isdir(hit.cwd):
+        why = "unknown session" if hit is None else (hit.note or "status is {}".format(hit.status))
+        print("{}: not resuming {}: {}".format(NAME, sid[:8], why), file=sys.stderr)
+        pause(30)
+        return EXIT_FAIL
+    return relaunch(hit, args.keep_bypass, args.reap, args.fork)
+
+
+def cmd_resume(args):
+    """Resume one restorable session in the current terminal."""
+    sel, errors = match_prefixes(restorable(include_older=True, quiet=True), [args.id])
+    for e in errors:
+        print(e, file=sys.stderr)
+    if errors or not sel:
+        return EXIT_FAIL
+    return relaunch(sel[0], args.keep_bypass)
+
+
+def cmd_attach(args):
+    rc = subprocess.call(["tmux", "attach", "-t", "=" + args.session])
+    if args.reap:
+        reap_own_terminal()
+    return rc
+
+
+def ensure_path():
+    """A window opened by `open`/launchd may carry a minimal PATH (claude, fzf, tmux live here)."""
+    extra = [os.path.join(HOME, ".local", "bin"), "/opt/homebrew/bin", "/usr/local/bin"]
+    cur = os.environ.get("PATH", "").split(":")
+    os.environ["PATH"] = ":".join([p for p in extra if p not in cur] + cur)
+
+
+def reap_own_terminal():
+    """Belt-and-braces for GHOSTTY_ARGS: find the terminal instance that was spawned FOR
+    us (its own argv carries `-e <this script>`) and, if we are its only surface, ask it
+    to quit once we have exited. Never touches an instance without that marker (the
+    user's main terminal) or one that has other windows."""
+    pid = os.getpid()
+    for _ in range(12):
+        ppid = ps("ppid", pid)
+        if not ppid or not ppid.isdigit() or int(ppid) <= 1:
+            return
+        pid = int(ppid)
+        if os.path.basename(ps("comm", pid) or "").lower() == "ghostty":
+            break
+    else:
+        return
+    inst_argv, _ = proc_argv(pid)
+    if not inst_argv or "-e" not in inst_argv or SELF not in inst_argv:
+        return
+    if len(children(pid)) > 1:
+        return
+    # TERM from a detached helper so it lands after our surface has closed.
+    subprocess.Popen([sys.executable, "-c", "import os,signal,sys,time; time.sleep(0.7); os.kill(int(sys.argv[1]), signal.SIGTERM)",
+                      str(pid)], start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def cmd_prune(args):
+    if not os.path.exists(REGISTRY):
+        print("registry is empty")
+        return EXIT_OK
+    t0 = now_iso()
+    cutoff = datetime.datetime.now().astimezone() - datetime.timedelta(days=args.days)
+    live, stale = live_sessions()
+    protected = {d["sessionId"] for d in live + stale}   # while a pid file lingers, keep its `forgotten`/end record
+    drop = set()
+    sessions = all_sessions()
+    for s in sessions:
+        if s.id in protected or s.status in ("live", "restoring"):
+            continue
+        when = parse_ts(s.ts) or cutoff
+        if s.status in RESTORABLE and age_days(s.ts) <= max(args.days, MAX_AGE_DAYS):
+            continue
+        if when < cutoff:
+            drop.add(s.id)
+    shown = {s.id for s in sessions}
+    drop |= {sid for sid in read_registry() if sid not in shown and sid not in protected}   # end-only / foreign ids
+    kept, dropped = [], 0
+    with registry_lock():
+        with open(REGISTRY, encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+        recs = []
+        for line in lines:
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                rec = None
+            recs.append(rec if isinstance(rec, dict) else None)
+        # anything written for a doomed id since we started (a resume just now) saves it
+        drop -= {r.get("session_id") for r in recs if r and isinstance(r.get("ts"), str) and r["ts"] >= t0}
+        for line, rec in zip(lines, recs):
+            if rec is None or rec.get("session_id") in drop:
+                dropped += 1
+            else:
+                kept.append(line if line.endswith("\n") else line + "\n")
+        if dropped:
+            if args.keep_backup:
+                shutil.copy2(REGISTRY, REGISTRY + ".bak")
+                os.chmod(REGISTRY + ".bak", 0o600)
+            tmp = REGISTRY + ".tmp"
+            fd = open_private(tmp, os.O_WRONLY | os.O_TRUNC)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.writelines(kept)
+            os.replace(tmp, REGISTRY)
+    print("prune: dropped {} event(s) of {} session(s); kept {}{}".format(
+        dropped, len(drop), len(kept), " (backup: {}.bak)".format(REGISTRY) if dropped and args.keep_backup else ""))
+    return EXIT_OK
+
+
+# --- install / uninstall / doctor ------------------------------------------------------
+def settings_path():
+    return os.path.join(CLAUDE_DIR, "settings.json")
+
+
+def is_our_hook(command):
+    try:
+        toks = shlex.split(command or "")
+    except ValueError:
+        return False
+    return len(toks) >= 2 and os.path.basename(toks[0]) == NAME and toks[-1] == "hook"
+
+
+def merge_hooks(data, command):
+    """Add (or repoint) our SessionStart/SessionEnd entries; never touch anyone else's."""
+    hooks = data.setdefault("hooks", {})
+    if not isinstance(hooks, dict):
+        raise ValueError('"hooks" in settings.json is not an object')
+    for ev in ("SessionStart", "SessionEnd"):
+        groups = hooks.setdefault(ev, [])
+        if not isinstance(groups, list):
+            raise ValueError('"hooks.{}" in settings.json is not a list'.format(ev))
+        found = False
+        for g in groups:
+            for h in (g.get("hooks") if isinstance(g, dict) and isinstance(g.get("hooks"), list) else []):
+                if isinstance(h, dict) and h.get("type") == "command" and is_our_hook(h.get("command")):
+                    found = True
+                    h["command"] = command
+        if not found:
+            groups.append({"hooks": [{"type": "command", "command": command, "timeout": 10}]})
+    return data
+
+
+def remove_hooks(data):
+    hooks = data.get("hooks")
+    if not isinstance(hooks, dict):
+        return data
+    for ev in ("SessionStart", "SessionEnd"):
+        groups = hooks.get(ev)
+        if not isinstance(groups, list):
+            continue
+        new = []
+        for g in groups:
+            if isinstance(g, dict) and isinstance(g.get("hooks"), list):
+                g["hooks"] = [h for h in g["hooks"] if not (isinstance(h, dict) and is_our_hook(h.get("command")))]
+                if not g["hooks"]:
+                    continue
+            new.append(g)
+        if new:
+            hooks[ev] = new
+        else:
+            del hooks[ev]
+    if not hooks:
+        del data["hooks"]
+    return data
+
+
+def edit_settings(fn, dry_run):
+    """Load settings.json, apply fn, show the diff, back up and write atomically."""
+    path = settings_path()
+    before = "{}\n"
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as f:
+            before = f.read()
+    try:
+        data = json.loads(before) if before.strip() else {}
+    except ValueError as e:
+        print("{}: {} is not valid JSON ({}); changing nothing".format(NAME, path, e), file=sys.stderr)
+        return False
+    if not isinstance(data, dict):
+        print("{}: {} is not a JSON object; changing nothing".format(NAME, path), file=sys.stderr)
+        return False
+    try:
+        after = json.dumps(fn(data), indent=2, ensure_ascii=False) + "\n"
+    except ValueError as e:
+        print("{}: {}; changing nothing".format(NAME, e), file=sys.stderr)
+        return False
+    if json.loads(after) == json.loads(before or "{}"):
+        print("settings: {} already up to date".format(tilde(path)))
+        return True
+    sys.stdout.writelines(difflib.unified_diff(before.splitlines(True), after.splitlines(True), tilde(path), tilde(path) + " (new)"))
+    if dry_run:
+        return True
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    if os.path.exists(path):
+        bak = "{}.bak-{}".format(path, datetime.datetime.now().strftime("%Y%m%d-%H%M%S"))
+        shutil.copy2(path, bak)
+        print("settings: backup at {}".format(tilde(bak)))
+    tmp = path + ".tmp-" + NAME
+    mode = os.stat(path).st_mode & 0o777 if os.path.exists(path) else 0o600
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(after)
+    os.replace(tmp, path)
+    return True
+
+
+def launchd_plist(binary):
+    dirs = [os.path.dirname(binary), os.path.join(HOME, ".local", "bin"), "/opt/homebrew/bin", "/usr/local/bin",
+            "/usr/bin", "/bin", "/usr/sbin", "/sbin"]
+    path_env = ":".join(d for i, d in enumerate(dirs) if d not in dirs[:i])
+    esc = lambda s: s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")  # noqa: E731
+    # bake in the configuration this install resolved, so the agent sees what the shell saw
+    env = [("PATH", path_env)] + [(k, v) for k, v, default in (
+        ("CLAUDE_CONFIG_DIR", CLAUDE_DIR, os.path.join(HOME, ".claude")),
+        ("CLAUDE_BARDO_DIR", STATE_DIR, os.path.join(HOME, ".local", "state", NAME)),
+        ("CLAUDE_BARDO_TERMINAL", TERMINAL, "ghostty"),
+        ("CLAUDE_BARDO_LAUNCHER", LAUNCHER, "")) if v != default]
+    env_xml = "".join("<key>{}</key><string>{}</string>".format(k, esc(v)) for k, v in env)
+    return """<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- written by "{name} install" (launchd option): at login, if a session died, open ONE window with the picker.
+     Nothing relaunches until you press Enter, and permission bypass is never replayed from here. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>{label}</string>
+  <key>ProgramArguments</key>
+  <array><string>{bin}</string><string>autorestore</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>EnvironmentVariables</key>
+  <dict>{env}</dict>
+  <key>Umask</key><integer>63</integer>
+  <key>StandardOutPath</key><string>{log}</string>
+  <key>StandardErrorPath</key><string>{log}</string>
+</dict>
+</plist>
+""".format(name=NAME, label=LAUNCHD_LABEL, bin=esc(binary), env=env_xml, log=esc(os.path.join(STATE_DIR, "launchd.log")))
+
+
+def man_path(bin_dir):
+    """~/.local/bin -> ~/.local/share/man/man1: man(1) searches <prefix>/share/man for every <prefix>/bin on PATH."""
+    return os.path.join(os.path.dirname(bin_dir), "share", "man", "man1", NAME + ".1")
+
+
+def plist_path():
+    return os.path.join(HOME, "Library", "LaunchAgents", LAUNCHD_LABEL + ".plist")
+
+
+def cmd_install(args):
+    bin_dir = os.path.abspath(os.path.expanduser(args.bin_dir))
+    dest = os.path.join(bin_dir, NAME)
+    src = os.path.realpath(os.path.abspath(__file__))
+    if os.path.realpath(dest) != src:
+        print("binary: {} -> {}".format(tilde(src), tilde(dest)))
+        if not args.dry_run:
+            os.makedirs(bin_dir, exist_ok=True)
+            tmp = dest + ".tmp"
+            shutil.copyfile(src, tmp)
+            os.chmod(tmp, 0o755)
+            os.replace(tmp, dest)
+    else:
+        print("binary: {} (already in place)".format(tilde(dest)))
+    if bin_dir not in os.environ.get("PATH", "").split(":"):
+        print("note: {} is not on your PATH".format(tilde(bin_dir)))
+    page = os.path.join(os.path.dirname(src), NAME + ".1")      # present in a clone, absent in a curl install
+    if os.path.isfile(page):
+        print("man page: {}".format(tilde(man_path(bin_dir))))
+        if not args.dry_run:
+            os.makedirs(os.path.dirname(man_path(bin_dir)), exist_ok=True)
+            shutil.copyfile(page, man_path(bin_dir))
+    command = shlex.quote(dest) + " hook"
+    if not edit_settings(lambda d: merge_hooks(d, command), args.dry_run):
+        return EXIT_FAIL
+    if args.launchd:
+        if sys.platform != "darwin":
+            print("--launchd is macOS-only", file=sys.stderr)
+            return EXIT_FAIL
+        pl = plist_path()
+        print("login agent: {}".format(tilde(pl)))
+        if not args.dry_run:
+            ensure_state()                  # launchd will not create the log's directory
+            os.makedirs(os.path.dirname(pl), exist_ok=True)
+            with open(pl, "w", encoding="utf-8") as f:
+                f.write(launchd_plist(dest))
+            domain = "gui/{}".format(os.getuid())
+            subprocess.run([LAUNCHCTL, "bootout", "{}/{}".format(domain, LAUNCHD_LABEL)], stderr=subprocess.DEVNULL)
+            subprocess.run([LAUNCHCTL, "bootstrap", domain, pl])
+    if not args.dry_run:
+        args.force, args.quiet = False, False
+        cmd_snapshot(args)
+        print("done. New sessions register themselves; `{} doctor` checks the setup.".format(NAME))
+    return EXIT_OK
+
+
+def cmd_uninstall(args):
+    if not edit_settings(remove_hooks, args.dry_run):
+        return EXIT_FAIL
+    pl = plist_path()
+    if os.path.exists(pl):
+        print("login agent: removing {}".format(tilde(pl)))
+        if not args.dry_run:
+            subprocess.run([LAUNCHCTL, "bootout", "gui/{}/{}".format(os.getuid(), LAUNCHD_LABEL)], stderr=subprocess.DEVNULL)
+            os.remove(pl)
+    bin_dir = os.path.abspath(os.path.expanduser(args.bin_dir))
+    for what, path in (("binary", os.path.join(bin_dir, NAME)), ("man page", man_path(bin_dir))):
+        if os.path.isfile(path) or os.path.islink(path):
+            print("{}: removing {}".format(what, tilde(path)))
+            if not args.dry_run:
+                os.remove(path)
+    if args.purge:
+        print("state: removing {}".format(tilde(STATE_DIR)))
+        if not args.dry_run:
+            shutil.rmtree(STATE_DIR, ignore_errors=True)
+    else:
+        print("state kept at {} (`{} uninstall --purge`, or delete it)".format(tilde(STATE_DIR), NAME))
+    if shutil.which("tmux") and subprocess.run(["tmux", "has-session", "-t", "=" + TMUX_SESSION],
+                                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
+        print("note: tmux session '{}' is still running (tmux kill-session -t ={})".format(TMUX_SESSION, TMUX_SESSION))
+    return EXIT_OK
+
+
+def _settings_layers():
+    for name in ("settings.json", "settings.local.json"):
+        p = os.path.join(CLAUDE_DIR, name)
+        try:
+            with open(p, encoding="utf-8") as f:
+                d = json.load(f)
+            if isinstance(d, dict):
+                yield p, d
+        except (OSError, ValueError):
+            continue
+
+
+def newer_than_verified(version):
+    """Does a `claude --version` string name a release after FLAGS_VERIFIED_ON? Compared as
+    numbers, so 2.1.1000 is newer than 2.1.296."""
+    m = re.match(r"\s*(\d+(?:\.\d+)*)", version or "")
+    return bool(m) and tuple(map(int, m.group(1).split("."))) > tuple(map(int, FLAGS_VERIFIED_ON.split(".")))
+
+
+def cmd_doctor(_args):
+    """Check the install and the Claude Code internals this tool depends on."""
+    bad = 0
+
+    def say(mark, msg):
+        nonlocal bad
+        bad += mark == "✗"
+        print("{} {}".format(mark, msg))
+
+    say("✓" if sys.platform == "darwin" else "!",
+        "platform {} {}".format(sys.platform, "" if sys.platform == "darwin" else "(experimental: use restore --tmux)"))
+    say("✓" if sys.version_info >= (3, 7) else "✗", "python {}".format(sys.version.split()[0]))
+    claude = shutil.which("claude")
+    ver = (run([claude, "--version"]) or "").strip() if claude else ""
+    say("✓" if claude else "✗", "claude {} {}".format(tilde(claude) if claude else "not on PATH", ver))
+    if newer_than_verified(ver):
+        say("!", "Claude Code is newer than the flag tables ({}): its new flags are not replayed. "
+                 "A newer {} may know them: {}#update".format(FLAGS_VERIFIED_ON, NAME, HOMEPAGE))
+    found = {"SessionStart": [], "SessionEnd": []}
+    for p, d in _settings_layers():
+        if d.get("disableAllHooks"):
+            say("✗", "disableAllHooks is set in {}".format(tilde(p)))
+        hooks = d.get("hooks") if isinstance(d.get("hooks"), dict) else {}
+        for ev in found:
+            for g in hooks.get(ev) or []:
+                for h in (g.get("hooks") or []) if isinstance(g, dict) else []:
+                    if isinstance(h, dict) and is_our_hook(h.get("command")):
+                        found[ev].append(shlex.split(h["command"])[0])
+    for ev, cmds in found.items():
+        if not cmds:
+            say("✗", "no {} hook in {} (run `{} install`)".format(ev, tilde(settings_path()), NAME))
+        for c in cmds:
+            ok = os.access(os.path.expanduser(c), os.X_OK)
+            say("✓" if ok else "✗", "{} hook -> {}{}".format(ev, tilde(c), "" if ok else " (missing or not executable)"))
+    if os.path.isdir(STATE_DIR):
+        mode = os.stat(STATE_DIR).st_mode & 0o777
+        say("✓" if mode & 0o077 == 0 else "!", "state {} (mode {:o})".format(tilde(STATE_DIR), mode))
+    else:
+        say("!", "state {} does not exist yet (no session registered)".format(tilde(STATE_DIR)))
+    starts = [r["start"]["ts"] for r in read_registry().values() if r["start"] and isinstance(r["start"].get("ts"), str)]
+    if starts:
+        latest = max(starts)
+        say("✓" if age_days(latest) < 7 else "!", "last session registered {} ago".format(age(latest)))
+        recent = [r["start"] for r in read_registry().values() if r["start"] and r["start"].get("ts") == latest]
+        if recent and not recent[0].get("pid"):
+            say("!", "the last start record has no pid (CLAUDE_PID missing?): flags will not be replayed")
+    live, stale = live_sessions()
+    say("✓" if os.path.isdir(LIVE_DIR) else "!", "{}: {} live, {} lingering".format(tilde(LIVE_DIR), len(live), len(stale)))
+    cmd, why = launcher_cmd(["true"])
+    if cmd:
+        key = terminal_key(TERMINAL)
+        app = TERMINAL_APPS.get(key)
+        present = LAUNCHER or not app or any(os.path.isdir(os.path.join(d, app + ".app"))
+                                             for d in ("/Applications", os.path.join(HOME, "Applications"), "/System/Applications/Utilities"))
+        say("✓" if present else "!", "terminal {}{}".format(LAUNCHER or app, "" if present else " (app not found)"))
+    else:
+        say("!", "terminal: {}".format(why))
+    for tool, why_ in (("fzf", "the picker"), ("tmux", "restore --tmux")):
+        say("✓" if shutil.which(tool) else "·", "{} {}".format(tool, "found" if shutil.which(tool) else "not found (optional: {})".format(why_)))
+    say("✓" if os.path.exists(plist_path()) else "·", "login agent {}".format(
+        "installed" if os.path.exists(plist_path()) else "not installed (optional: install --launchd)"))
+    return EXIT_FAIL if bad else EXIT_OK
+
+
+# --- main -------------------------------------------------------------------------------
+def build_parser():
+    p = argparse.ArgumentParser(prog=NAME, description=__doc__.split("\n\n")[0],
+                                formatter_class=argparse.RawDescriptionHelpFormatter,
+                                epilog="exit codes: 0 ok, 1 failure, 2 usage, 3 nothing to restore/selected")
+    p.add_argument("--version", action="version", version="{} {}".format(NAME, __version__))
+    sub = p.add_subparsers(dest="cmd", metavar="<command>")
+    sp = sub.add_parser("list", help="what died, what is live (the default)")
+    sp.add_argument("--all", "-a", action="store_true", help="include closed and unresumable sessions")
+    sp.add_argument("--json", action="store_true", help="one JSON object per line")
+    sp.set_defaults(fn=cmd_list)
+    sp = sub.add_parser("restore", help="relaunch restorable sessions")
+    sp.add_argument("ids", nargs="*", help="session id prefixes (default: interactive picker)")
+    sp.add_argument("--all", "-a", action="store_true", help="restore every candidate without asking")
+    sp.add_argument("--older", action="store_true", help="include sessions interrupted more than {} days ago".format(MAX_AGE_DAYS))
+    sp.add_argument("--tmux", action="store_true", help="one window per session inside tmux session '{}'".format(TMUX_SESSION))
+    sp.add_argument("--no-attach", action="store_true", help="with --tmux: do not open a window attached to it")
+    sp.add_argument("--terminal", metavar="APP", help="ghostty (default), iterm, terminal, alacritty, wezterm, kitty")
+    sp.add_argument("--keep-bypass", action="store_true", help="replay --dangerously-skip-permissions & co (off by default)")
+    sp.add_argument("--fork", action="store_true", help="open a COPY of live sessions (--fork-session): rehearse a restore")
+    sp.add_argument("--dry-run", "-n", action="store_true", help="print what would be launched")
+    sp.add_argument("--reap", action="store_true", help=argparse.SUPPRESS)
+    sp.set_defaults(fn=cmd_restore)
+    sp = sub.add_parser("resume", help="relaunch one session in this terminal")
+    sp.add_argument("id", help="session id prefix")
+    sp.add_argument("--keep-bypass", action="store_true", help="replay permission bypass flags")
+    sp.set_defaults(fn=cmd_resume)
+    sp = sub.add_parser("forget", help="mark sessions as closed on purpose")
+    sp.add_argument("ids", nargs="*", help="session id prefixes")
+    sp.add_argument("--forks", action="store_true", help="also every dead copy made by restore --fork")
+    sp.set_defaults(fn=cmd_forget)
+    sp = sub.add_parser("prune", help="drop old closed/unresumable history")
+    sp.add_argument("--days", type=int, default=30, help="keep anything newer than this (default 30)")
+    sp.add_argument("--keep-backup", action="store_true", help="leave registry.jsonl.bak behind")
+    sp.set_defaults(fn=cmd_prune)
+    sp = sub.add_parser("snapshot", help="register the sessions that are live right now")
+    sp.add_argument("--force", action="store_true", help="re-register even if already known (repairs a bad record)")
+    sp.set_defaults(fn=cmd_snapshot)
+    sub.add_parser("doctor", help="check the install and the Claude Code internals").set_defaults(fn=cmd_doctor)
+    for name, fn, text in (("install", cmd_install, "copy to --bin-dir and add the hooks to settings.json"),
+                           ("uninstall", cmd_uninstall, "remove the hooks, the login agent and the binary")):
+        sp = sub.add_parser(name, help=text)
+        sp.add_argument("--bin-dir", default=os.path.join("~", ".local", "bin"), help="default ~/.local/bin")
+        sp.add_argument("--dry-run", "-n", action="store_true", help="show the changes, make none")
+        if name == "install":
+            sp.add_argument("--launchd", action="store_true", help="also open the picker at login when something died")
+        else:
+            sp.add_argument("--purge", action="store_true", help="also delete the registry and logs")
+        sp.set_defaults(fn=fn)
+    sub.add_parser("hook", help="SessionStart/SessionEnd hook target (JSON on stdin)").set_defaults(fn=cmd_hook)
+    sub.add_parser("autorestore", help="login agent target").set_defaults(fn=cmd_autorestore)
+    # internal: baked into spawned windows' command lines, stable within a major version
+    sp = sub.add_parser("_launch")
+    sp.add_argument("id")
+    sp.add_argument("--reap", action="store_true")
+    sp.add_argument("--keep-bypass", action="store_true")
+    sp.add_argument("--fork", action="store_true")
+    sp.set_defaults(fn=cmd_launch)
+    sp = sub.add_parser("_attach")
+    sp.add_argument("session")
+    sp.add_argument("--reap", action="store_true")
+    sp.set_defaults(fn=cmd_attach)
+    return p
+
+
+def main(argv=None):
+    ensure_path()
+    p = build_parser()
+    if argv is None:
+        argv = sys.argv[1:]
+    if not argv or (argv[0].startswith("-") and argv[0] not in ("-h", "--help", "--version")):
+        argv = ["list"] + list(argv)        # `claude-bardo` and `claude-bardo --all` mean list
+    args = p.parse_args(argv)
+    if not getattr(args, "fn", None):
+        p.print_help()
+        return EXIT_USAGE
+    return args.fn(args) or 0
+
+
+if __name__ == "__main__":
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)   # `claude-bardo list | head` exits quietly
+    sys.exit(main())

@@ -1,0 +1,135 @@
+.TH CLAUDE-BARDO 1 2026-09-30 "claude-bardo 0.1.0" "User Commands"
+.SH NAME
+claude-bardo \- bring Claude Code sessions back after a crash or a reboot
+.SH SYNOPSIS
+.B claude-bardo
+.RI [ command ]
+.RI [ options ]
+.SH DESCRIPTION
+.B claude-bardo
+remembers every interactive Claude Code session through its SessionStart and
+SessionEnd hooks, and relaunches the ones that died: each in its own terminal
+window, in its own directory, with its own flags, mid-conversation.
+.PP
+Nothing needs to be run before a reboot: the hooks keep the registry current.
+A terminal crash (SIGHUP), a reboot or a macOS logout (SIGTERM) ends a session with reason
+.BR other ;
+a SIGKILL or a power cut leaves no end at all but a lingering
+.IR ~/.claude/sessions/<pid>.json .
+Both are restorable.
+.BR /exit ,
+.BR /clear ,
+.B /resume
+and Claude Code's own
+.B /logout
+are deliberate: those sessions never come back.
+.SH COMMANDS
+.TP
+.BR list " [" \-\-all "] [" \-\-json ]
+What died and what is live. The default command.
+.TP
+.BR restore " [" \fIid\fR ...] [" \-\-all "] [" \-\-older "] [" \-\-tmux "] [" \-\-terminal " \fIapp\fR] [" \-n ]
+Relaunch restorable sessions. Without ids, a picker opens with the latest
+death wave (everything that died within 30 minutes of the newest death)
+pre-selected and older deaths below it.
+.B \-\-dry\-run
+prints the commands instead.
+.TP
+.B restore \-\-fork
+Open a copy of each live session (new id, same history) in the chosen
+terminal. The originals keep running: a rehearsal of a restore, or a way to
+move sessions to another terminal app.
+.TP
+.BI resume " id"
+Relaunch one session in the current terminal.
+.TP
+.BR forget " [\fIid\fR ...] [" \-\-forks ]
+Mark sessions as closed on purpose: they leave the picker.
+.B \-\-forks
+closes every dead copy that
+.B restore \-\-fork
+made.
+.TP
+.BR prune " [" \-\-days " \fIn\fR]"
+Drop closed and unresumable history older than
+.I n
+days (default 30).
+.TP
+.B doctor
+Check the hooks, the state directory, the terminal and the Claude Code
+internals this tool relies on.
+.TP
+.BR install " [" \-\-launchd "] [" \-n ]
+Copy the binary to
+.IR ~/.local/bin ,
+add the hooks to
+.I ~/.claude/settings.json
+(with a backup, never touching other hooks) and register running sessions.
+.B \-\-launchd
+adds a login agent that opens the picker when the last shutdown killed
+something.
+.TP
+.BR uninstall " [" \-\-purge ]
+Remove the hooks, the login agent and the binary;
+.B \-\-purge
+also deletes the registry.
+.PP
+Id prefixes need at least 4 characters and must match one session.
+.SH REPLAY
+Known flags and their values are replayed from the process's exact argv.
+Never replayed: the prompt, session selectors
+.RB ( \-\-resume ,
+.BR \-\-continue ,
+.BR \-\-session\-id ,
+.BR \-\-name ),
+one-shot modes
+.RB ( \-p ,
+.BR \-\-bg )
+and
+.BR \-\-worktree .
+Permission bypass
+.RB ( \-\-dangerously\-skip\-permissions ,
+.BR "\-\-permission\-mode bypassPermissions" ,
+and friends) is dropped unless
+.B restore \-\-keep\-bypass
+is given; the login agent never keeps it.
+.SH ENVIRONMENT
+.TP
+.B CLAUDE_BARDO_DIR
+State directory (default
+.IR ~/.local/state/claude-bardo ).
+.TP
+.B CLAUDE_BARDO_TERMINAL
+.BR ghostty " (default), " iterm ", " terminal ", " alacritty ", " wezterm " or " kitty .
+.TP
+.B CLAUDE_BARDO_LAUNCHER
+A command template for any other terminal, with a
+.B {cmd}
+token, e.g.
+.BR "myterm \-e {cmd}" .
+.TP
+.B CLAUDE_CONFIG_DIR
+Claude Code's directory (default
+.IR ~/.claude ).
+.SH FILES
+.TP
+.I ~/.local/state/claude-bardo/registry.jsonl
+One JSON event per session start and end (schema
+.BR v:1 ),
+mode 0600.
+.TP
+.I ~/.local/state/claude-bardo/bardo.log
+Hook errors and relaunch failures.
+.SH EXIT STATUS
+0 ok, 1 failure, 2 usage error, 3 nothing to restore or nothing selected.
+.SH EXAMPLES
+.nf
+claude-bardo                              # what died, what is live
+claude-bardo restore                      # after a reboot: Enter
+claude-bardo restore \-\-fork \-\-terminal iterm   # rehearse, originals untouched
+claude-bardo list \-\-json | jq .status
+.fi
+.SH SEE ALSO
+.BR claude (1),
+.BR tmux (1),
+.BR fzf (1)

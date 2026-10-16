@@ -1,0 +1,15 @@
+# run artifacts and anything the tool can write, should CLAUDE_BARDO_DIR ever point in here
+qa/.results/
+registry.jsonl*
+registry.lock
+restore.lock
+*.log
+*.log.1
+
+__pycache__/
+*.py[co]
+.pytest_cache/
+.ruff_cache/
+.DS_Store
+.envrc
+.claude/settings.local.json

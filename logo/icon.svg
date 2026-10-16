@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512"><g transform="translate(0 0) scale(1.0)">
+  <!-- glow -->
+  <circle cx="256" cy="170" r="118" fill="#FFD447" opacity=".16"/>
+  <!-- flame -->
+  <path d="M256 58 C288 112 326 146 326 194 C326 234 294 258 256 258 C218 258 186 234 186 194 C186 146 224 112 256 58 Z" fill="#FF6B2C"/>
+  <path d="M256 128 C274 158 296 178 296 206 C296 232 278 250 256 250 C234 250 216 232 216 206 C216 178 238 158 256 128 Z" fill="#FFD447"/>
+  <!-- wick -->
+  <rect x="249" y="236" width="14" height="26" rx="5" fill="#2A1A0C"/>
+  <!-- rim -->
+  <rect x="112" y="254" width="288" height="30" rx="15" fill="#F6C766"/>
+  <!-- bowl -->
+  <path d="M124 276 H388 C388 344 330 390 256 390 C182 390 124 344 124 276 Z" fill="#E9A23B"/>
+  <!-- stem + foot -->
+  <path d="M232 386 H280 L298 440 H214 Z" fill="#B8741F"/>
+  <rect x="168" y="432" width="176" height="28" rx="14" fill="#E9A23B"/>
+  <!-- the prompt -->
+  <path d="M206 306 L236 328 L206 350" fill="none" stroke="#2A1A0C" stroke-width="17" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M256 352 H306" stroke="#2A1A0C" stroke-width="17" stroke-linecap="round"/>
+</g></svg>

@@ -1,0 +1,25 @@
+<!-- Source of docs/banner.png, the first slide and the README header.
+     Rebuild: rsvg-convert -w 1600 docs/banner.svg -o docs/banner.png (needs the Menlo font) -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 540" width="1600" height="540">
+  <rect x="1" y="1" width="1598" height="538" rx="28" fill="#0D1117" stroke="#30363D" stroke-width="2"/>
+  <circle cx="44" cy="40" r="10" fill="#FF5F57"/>
+  <circle cx="80" cy="40" r="10" fill="#FDB528"/>
+  <circle cx="116" cy="40" r="10" fill="#28C840"/>
+
+  <rect x="700" y="80" width="200" height="200" rx="44" fill="#FFFAF4"/>
+  <svg x="710" y="88" width="180" height="180" viewBox="0 0 512 512">
+    <circle cx="256" cy="170" r="118" fill="#FFD447" opacity=".16"/>
+    <path d="M256 58 C288 112 326 146 326 194 C326 234 294 258 256 258 C218 258 186 234 186 194 C186 146 224 112 256 58 Z" fill="#FF6B2C"/>
+    <path d="M256 128 C274 158 296 178 296 206 C296 232 278 250 256 250 C234 250 216 232 216 206 C216 178 238 158 256 128 Z" fill="#FFD447"/>
+    <rect x="249" y="236" width="14" height="26" rx="5" fill="#2A1A0C"/>
+    <rect x="112" y="254" width="288" height="30" rx="15" fill="#F6C766"/>
+    <path d="M124 276 H388 C388 344 330 390 256 390 C182 390 124 344 124 276 Z" fill="#E9A23B"/>
+    <path d="M232 386 H280 L298 440 H214 Z" fill="#B8741F"/>
+    <rect x="168" y="432" width="176" height="28" rx="14" fill="#E9A23B"/>
+    <path d="M206 306 L236 328 L206 350" fill="none" stroke="#2A1A0C" stroke-width="17" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M256 352 H306" stroke="#2A1A0C" stroke-width="17" stroke-linecap="round"/>
+  </svg>
+
+  <text x="800" y="368" text-anchor="middle" font-family="Menlo, 'DejaVu Sans Mono', monospace" font-size="78" font-weight="bold" xml:space="preserve"><tspan fill="#8B949E">claude-</tspan><tspan fill="#FDB528">bardo</tspan></text>
+  <text x="800" y="440" text-anchor="middle" font-family="Menlo, 'DejaVu Sans Mono', monospace" font-size="30" fill="#C9D1D9" xml:space="preserve">Your Claude Code <tspan fill="#79C0FF">sessions</tspan>, <tspan fill="#FDB528">back</tspan> after a <tspan fill="#EC4F1C">reboot</tspan>, a <tspan fill="#EC4F1C">crash</tspan> or a <tspan fill="#EC4F1C">power cut</tspan></text>
+</svg>
